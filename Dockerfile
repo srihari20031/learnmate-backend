@@ -1,5 +1,5 @@
 #always start with a base image 
-From python:3.12-slim
+FROM python:3.12-slim
 # set the working directory in the container
 WORKDIR /app
 # copy the requirements file into the container
