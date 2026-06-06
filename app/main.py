@@ -11,7 +11,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:3001", "https://learnmate-frontend-4q9e.vercel.app"],  # your Next.js dev server
+    allow_origins=["http://localhost:3000", "http://localhost:3001", "https://learnmate-frontend-three.vercel.app"],  # your Next.js dev server
     allow_credentials=True,
     allow_methods=["*"],  # allows OPTIONS, POST, GET, etc.
     allow_headers=["*"],  # allows Content-Type, session-id, authorization, etc.
