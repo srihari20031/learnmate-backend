@@ -1,46 +1,38 @@
 from fastapi import APIRouter, Header, Depends
+
 from app.models.schema import ChatRequest, LearnResponse
 from app.services.claude_service import get_claude_response, generate_curriculum_ai
 from app.services.note_generator import generate_note
 from app.services.notion_service import create_notion_topic, create_user_parent_page
-from app.core.session import get_context
+from app.core.session import get_context, get_chat
 from app.core.security import get_current_user
 from app.models.user import TokenData
 from app.database import users_collection
 from app.core.config import settings
 from app.services.cache_service import (
-    get_cached_curriculum, set_cached_curriculum,
-    get_cached_note, set_cached_note
+    get_cached_curriculum,
+    set_cached_curriculum,
+    get_cached_note,
+    set_cached_note,
 )
 
 router = APIRouter()
 
 
-@router.post("/message")
-async def learn(
-    request: ChatRequest,
-    session_id: str = Header(...),
-    current_user: TokenData = Depends(get_current_user)
-):
-    # Step 1 — chat with agent
-    response = await get_claude_response(session_id, request.message, current_user.email)
+async def generate_learning_notes(session_id: str, user_email: str) -> dict:
+    await get_chat(session_id, user_email)
 
-    # Step 2 — still collecting info
-    if "READY_TO_GENERATE" not in response.upper():
-        return LearnResponse(
-            response=response,
-            session_id=session_id,
-            status="chatting",
-            notion_urls=[]
-        )
-
-    # Step 3 — get collected context
-    context = await get_context(session_id, current_user.email)
-    known_stack = context.get("known_stack")
+    context = await get_context(session_id, user_email)
+    known_stack = context.get("known_stack") or "beginner"
     target_tech = context.get("target_tech")
 
-    # Step 4 — resolve Notion token and parent page
-    user_doc = await users_collection.find_one({"email": current_user.email})
+    if not target_tech:
+        return {
+            "status": "chatting",
+            "notion_urls": [],
+        }
+
+    user_doc = await users_collection.find_one({"email": user_email})
     notion_token = user_doc.get("notion_access_token") if user_doc else None
     notion_parent_page_id = user_doc.get("notion_parent_page_id") if user_doc else None
 
@@ -52,7 +44,7 @@ async def learn(
                 known_stack=known_stack or "",
             )
             await users_collection.update_one(
-                {"email": current_user.email},
+                {"email": user_email},
                 {"$set": {"notion_parent_page_id": notion_parent_page_id}},
             )
         except Exception as e:
@@ -62,13 +54,11 @@ async def learn(
         notion_token = settings.notion_api_key
         notion_parent_page_id = settings.notion_parent_page_id
 
-    # Step 5 — curriculum (cache first)
     topics = get_cached_curriculum(known_stack, target_tech)
     if not topics:
         topics = await generate_curriculum_ai(known_stack, target_tech)
         set_cached_curriculum(known_stack, target_tech, topics)
 
-    # Step 6 — generate notes and save to Notion
     urls = []
     for topic in topics:
         note_content = get_cached_note(topic, known_stack, target_tech)
@@ -85,9 +75,33 @@ async def learn(
         )
         urls.append(url)
 
+    return {
+        "status": "completed",
+        "notion_urls": urls,
+    }
+
+
+@router.post("/message")
+async def learn(
+    request: ChatRequest,
+    session_id: str = Header(...),
+    current_user: TokenData = Depends(get_current_user)
+):
+    response = await get_claude_response(session_id, request.message, current_user.email)
+
+    if "READY_TO_GENERATE" not in response.upper():
+        return LearnResponse(
+            response=response,
+            session_id=session_id,
+            status="chatting",
+            notion_urls=[]
+        )
+
+    result = await generate_learning_notes(session_id, current_user.email)
+
     return LearnResponse(
         response="Your notes are ready in Notion!",
         session_id=session_id,
-        status="completed",
-        notion_urls=urls
+        status=result["status"],
+        notion_urls=result["notion_urls"],
     )

@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     upstash_redis_token: str
     jwt_secret_key: str
     FRONTEND_URL: str = "http://localhost:3000"
+    chat_sliding_window_messages: int = 12
+    QDRANT_URL: str
+    QDRANT_API_KEY: str
     
 
     class Config:

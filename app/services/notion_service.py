@@ -14,7 +14,6 @@ def create_user_parent_page(access_token: str, target_tech: str, known_stack: st
     )
     return page["id"]
 
-
 def split_content(content: str, limit: int = 1900) -> list:
     chunks = []
     while len(content) > limit:
@@ -26,29 +25,112 @@ def split_content(content: str, limit: int = 1900) -> list:
     chunks.append(content)
     return chunks
 
+NOTION_CODE_LANGUAGES = {
+    "abap",
+    "abc",
+    "agda",
+    "arduino",
+    "assembly",
+    "bash",
+    "basic",
+    "bnf",
+    "c",
+    "c#",
+    "c++",
+    "clojure",
+    "coffeescript",
+    "coq",
+    "css",
+    "dart",
+    "dhall",
+    "diff",
+    "docker",
+    "ebnf",
+    "elixir",
+    "elm",
+    "erlang",
+    "f#",
+    "flow",
+    "fortran",
+    "gherkin",
+    "glsl",
+    "go",
+    "graphql",
+    "groovy",
+    "haskell",
+    "hcl",
+    "html",
+    "idris",
+    "java",
+    "javascript",
+    "json",
+    "julia",
+    "kotlin",
+    "latex",
+    "less",
+    "lisp",
+    "livescript",
+    "llvm ir",
+    "lua",
+    "makefile",
+    "markdown",
+    "markup",
+    "matlab",
+    "mathematica",
+    "mermaid",
+    "nix",
+    "notion formula",
+    "objective-c",
+    "ocaml",
+    "pascal",
+    "perl",
+    "php",
+    "plain text",
+    "powershell",
+    "prolog",
+    "protobuf",
+    "purescript",
+    "python",
+    "r",
+    "racket",
+    "reason",
+    "ruby",
+    "rust",
+    "sass",
+    "scala",
+    "scheme",
+    "scss",
+    "shell",
+    "smalltalk",
+    "solidity",
+    "sql",
+    "swift",
+    "toml",
+    "typescript",
+    "vb.net",
+    "verilog",
+    "vhdl",
+    "visual basic",
+    "webassembly",
+    "xml",
+    "yaml",
+    "java/c/c++/c#",
+}
 
-notion = Client(auth=settings.notion_api_key)
+LANGUAGE_ALIASES = {
+    "dockerfile": "docker",
+    "text": "plain text",
+    "plaintext": "plain text",
+    "txt": "plain text",
+    "md": "markdown",
+    "sh": "shell",
+    "zsh": "shell",
+}
 
-
-def create_user_parent_page(access_token: str, target_tech: str, known_stack: str) -> str:
-    client = Client(auth=access_token)
-    page_title = f"LearnMate — {target_tech} (from {known_stack})"
-    page = client.pages.create(
-        parent={"type": "workspace", "workspace": True},
-        properties={"title": {"title": [{"text": {"content": page_title}}]}},
-    )
-    return page["id"]
-
-def split_content(content: str, limit: int = 1900) -> list:
-    chunks = []
-    while len(content) > limit:
-        split_at = content[:limit].rfind("\n")
-        if split_at == -1:
-            split_at = limit
-        chunks.append(content[:split_at])
-        content = content[split_at:]
-    chunks.append(content)
-    return chunks
+def normalize_code_language(language: str) -> str:
+    normalized = (language or "").strip().lower()
+    normalized = LANGUAGE_ALIASES.get(normalized, normalized)
+    return normalized if normalized in NOTION_CODE_LANGUAGES else "plain text"
 
 def content_to_blocks(content: str) -> list:
     blocks = []
@@ -61,7 +143,7 @@ def content_to_blocks(content: str) -> list:
         if line.startswith("```"):
             if not in_code_block:
                 in_code_block = True
-                code_language = line.replace("```", "").strip() or "plain text"
+                code_language = normalize_code_language(line.replace("```", "").strip() or "plain text")
             else:
                 in_code_block = False
                 blocks.append({

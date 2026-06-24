@@ -4,6 +4,7 @@ from app.api.notion import router as notion_router
 from app.api.notion_auth import router as notion_auth_router
 from app.api.learn import router as learn_router
 from app.api.auth import router as auth_router
+from app.core.qdrant import create_collection_if_not_exists
 from app.database import close_db
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -30,3 +31,7 @@ async def health():
 @app.on_event("shutdown")
 async def shutdown_event():
     await close_db()
+
+@app.on_event("startup")
+async def startup_event():
+    create_collection_if_not_exists()
