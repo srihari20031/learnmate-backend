@@ -1,10 +1,13 @@
-from groq import Groq
+import asyncio
+import re
+from types import SimpleNamespace
+from groq import AsyncGroq
 from app.core.config import settings
 from app.core.session import get_session, add_message, set_context, get_context
 from app.prompts.intake import SYSTEM_PROMPT
 import json
 
-client = Groq(api_key=settings.groq_api_key)
+client = AsyncGroq(api_key=settings.groq_api_key)
 MODEL = "llama-3.3-70b-versatile"
 MAX_CONTEXT_CHARS = 100_000
 
@@ -44,7 +47,7 @@ Return ONLY JSON like this, nothing else:
 {{"target_tech": "FastAPI", "known_stack": "Node.js"}}
 If not found return null for that field.
 """
-    response = client.chat.completions.create(
+    response = await client.chat.completions.create(
         model=MODEL,
         messages=[{"role": "user", "content": prompt}]
     )
@@ -68,38 +71,78 @@ async def get_claude_response(
     attachments: list[dict] | None = None,
 ) -> str:
     from app.services.embedding import generate_embeddings, search_embeddings
+    from app.services.rerank_service import rerank
+    from app.services.rag_service import get_session_chunks
+    from app.services.hybrid_service import hybrid_rank
+
+    # Hybrid retrieval, three stages:
+    #   recall    — dense (vector) + sparse (BM25), each casting a wide net
+    #   fusion    — Reciprocal Rank Fusion merges the two id lists into one pool
+    #   precision — the cross-encoder reranks that pool down to the final few
+    CANDIDATE_POOL = 20
+    FINAL_TOP_K = 5
+
+    document_context = ""
 
     # --------------------------------------------------
-    # Generate query embedding
+    # Fetch the session's chunks once. This doubles as the retrieval gate
+    # (empty -> skip everything) and as the BM25 corpus + id->text map below,
+    # so a plain conversation turn costs just this one indexed Mongo read.
     # --------------------------------------------------
 
-    query_embedding = generate_embeddings(user_message)
+    session_chunks = await get_session_chunks(current_user_email, session_id)
 
-    # --------------------------------------------------
-    # Search relevant chunks from Qdrant
-    # --------------------------------------------------
+    if session_chunks:
 
-    search_results = search_embeddings(
-        query_vector=query_embedding,
-        user_email=current_user_email,
-        session_id=session_id,
-        top_k=5,
-    )
+        # Dense recall. encode() is CPU-bound -> worker thread; the Qdrant query
+        # uses the async client, so it's a direct await (native non-blocking I/O).
+        query_embedding = await asyncio.to_thread(generate_embeddings, user_message)
+        dense_points = await search_embeddings(
+            query_vector=query_embedding,
+            user_email=current_user_email,
+            session_id=session_id,
+            top_k=CANDIDATE_POOL,
+        )
+        dense_ids = [
+            p.payload.get("chunk_id")
+            for p in dense_points
+            if p.payload.get("chunk_id")
+        ]
 
-    # --------------------------------------------------
-    # Build retrieved context
-    # --------------------------------------------------
+        # Sparse (BM25) recall + RRF fusion. Building the BM25 index over the
+        # session corpus is CPU work, so it's offloaded to a worker thread.
+        fused_ids = await asyncio.to_thread(
+            hybrid_rank,
+            user_message,
+            session_chunks,
+            dense_ids,
+            CANDIDATE_POOL,
+            session_id=session_id,
+        )
 
-    retrieved_chunks = []
+        # Turn fused ids back into rerank-compatible points (.score + .payload).
+        text_by_id = {c["chunk_id"]: c["text"] for c in session_chunks}
+        candidates = [
+            SimpleNamespace(
+                score=0.0,
+                payload={"text": text_by_id[cid], "chunk_id": cid},
+            )
+            for cid in fused_ids
+            if cid in text_by_id
+        ]
 
-    for result in search_results:
+        # Cross-encoder precision pass over the fused pool (CPU-bound, offloaded).
+        reranked_results = await asyncio.to_thread(
+            rerank, user_message, candidates, FINAL_TOP_K
+        )
 
-        text = result.payload.get("text")
+        retrieved_chunks = [
+            result.payload.get("text")
+            for result in reranked_results
+            if result.payload.get("text")
+        ]
 
-        if text:
-            retrieved_chunks.append(text)
-
-    document_context = "\n\n".join(retrieved_chunks)
+        document_context = "\n\n".join(retrieved_chunks)
 
     # --------------------------------------------------
     # Save user message
@@ -143,7 +186,7 @@ async def get_claude_response(
     # Call LLM
     # --------------------------------------------------
 
-    response = client.chat.completions.create(
+    response = await client.chat.completions.create(
         model=MODEL,
         messages=messages,
     )
@@ -152,12 +195,22 @@ async def get_claude_response(
 
     # --------------------------------------------------
     # Save assistant reply
+    #
+    # READY_TO_GENERATE is an internal control sentinel (see intake prompt),
+    # not user-facing text. Strip it from what we persist/display so it never
+    # leaks into the chat bubble on history reload. We still RETURN the raw
+    # reply so the caller (chat.py) can detect the sentinel and trigger note
+    # generation.
     # --------------------------------------------------
+
+    display_reply = re.sub(
+        r"READY_TO_GENERATE", "", reply, flags=re.IGNORECASE
+    ).strip()
 
     await add_message(
         session_id,
         "assistant",
-        reply,
+        display_reply,
         current_user_email,
     )
 
@@ -190,7 +243,7 @@ for a developer who already knows {known_stack}.
 Return ONLY a JSON array of topic strings, nothing else.
 Example: ["Routing", "Middleware", "Authentication"]
 """
-    response = client.chat.completions.create(
+    response = await client.chat.completions.create(
         model=MODEL,
         messages=[{"role": "user", "content": prompt}]
     )

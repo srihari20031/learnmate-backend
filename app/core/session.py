@@ -104,6 +104,14 @@ async def add_message(session_id: str, role: str, content: str, current_user_ema
 
 
 async def clear_session(session_id: str, current_user_email: str):
+    # Local import: keeps this module free of the embedding-model import chain
+    # that app.services.rag_service pulls in at import time.
+    from app.services.rag_service import delete_session_documents
+
+    # Remove uploaded documents (Mongo chunks + metadata + Qdrant vectors) so a
+    # reset doesn't leave orphaned data behind.
+    await delete_session_documents(current_user_email, session_id)
+
     await chats_collection.delete_one({"_id": session_id, "user_email": current_user_email})
     await contexts_collection.delete_one({"_id": session_id, "user_email": current_user_email})
 

@@ -1,8 +1,8 @@
-from groq import Groq
+from groq import AsyncGroq
 from app.core.config import settings
 from app.prompts.notes import NOTE_PROMPT
 
-client = Groq(api_key=settings.groq_api_key)
+client = AsyncGroq(api_key=settings.groq_api_key)
 MODEL = "llama-3.3-70b-versatile"
 
 async def generate_note(topic: str, known_stack: str, target_tech: str) -> str:
@@ -11,7 +11,7 @@ async def generate_note(topic: str, known_stack: str, target_tech: str) -> str:
         known_stack=known_stack,
         target_tech=target_tech
     )
-    response = client.chat.completions.create(
+    response = await client.chat.completions.create(
         model=MODEL,
         messages=[{"role": "user", "content": prompt}]
     )

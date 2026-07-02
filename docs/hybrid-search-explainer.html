@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>From Vector Search to Hybrid Search — LearnMate RAG</title>
+<style>
+  :root {
+    --dense:   #2563eb;   /* blue   */
+    --sparse:  #059669;   /* green  */
+    --fusion:  #7c3aed;   /* purple */
+    --rerank:  #ea580c;   /* orange */
+    --ink:     #1e293b;
+    --muted:   #64748b;
+    --line:    #cbd5e1;
+    --bg:      #f8fafc;
+    --card:    #ffffff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: var(--ink); background: var(--bg); margin: 0; line-height: 1.6;
+  }
+  .wrap { max-width: 960px; margin: 0 auto; padding: 40px 24px 80px; }
+  h1 { font-size: 30px; margin: 0 0 6px; }
+  h2 { font-size: 22px; margin: 48px 0 14px; padding-bottom: 8px; border-bottom: 2px solid var(--line); }
+  h3 { font-size: 17px; margin: 28px 0 8px; }
+  .sub { color: var(--muted); font-size: 16px; margin-top: 0; }
+  code { background: #eef2ff; color: #3730a3; padding: 1px 6px; border-radius: 5px; font-size: 0.9em; }
+  p { margin: 10px 0; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 22px; margin: 16px 0; box-shadow: 0 1px 2px rgba(0,0,0,.04); }
+
+  /* ---- flow diagram ---- */
+  .flow { display: flex; flex-direction: column; align-items: center; gap: 0; margin: 24px 0; }
+  .node {
+    border-radius: 10px; padding: 12px 18px; text-align: center; font-weight: 600;
+    color: #fff; min-width: 230px; box-shadow: 0 2px 6px rgba(0,0,0,.12);
+  }
+  .node small { display:block; font-weight: 400; opacity: .92; font-size: 12px; margin-top: 3px; }
+  .node.query  { background: #334155; }
+  .node.dense  { background: var(--dense); }
+  .node.sparse { background: var(--sparse); }
+  .node.fusion { background: var(--fusion); }
+  .node.rerank { background: var(--rerank); }
+  .node.llm    { background: #0f766e; }
+  .arrow { width: 2px; height: 24px; background: var(--line); position: relative; }
+  .arrow::after { content: "▼"; position: absolute; bottom: -6px; left: -5px; color: var(--line); font-size: 11px; }
+
+  .twocol { display: flex; gap: 18px; align-items: stretch; justify-content: center; flex-wrap: wrap; }
+  .branch { display: flex; flex-direction: column; align-items: center; flex: 1; min-width: 250px; }
+  .branch .label { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-bottom: 6px; font-weight: 700; }
+
+  .legend { display: flex; gap: 16px; flex-wrap: wrap; margin: 10px 0 0; font-size: 13px; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .dot { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+
+  table { border-collapse: collapse; width: 100%; margin: 14px 0; font-size: 14px; }
+  th, td { border: 1px solid var(--line); padding: 8px 10px; text-align: left; }
+  th { background: #f1f5f9; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .win { background: #ecfdf5; font-weight: 700; }
+  .badge { display:inline-block; font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 999px; color:#fff; }
+  .badge.new { background: var(--sparse); }
+  .badge.changed { background: var(--dense); }
+  .small { font-size: 13px; color: var(--muted); }
+  pre { background: #0f172a; color: #e2e8f0; padding: 14px 16px; border-radius: 10px; overflow-x: auto; font-size: 13px; line-height: 1.5; }
+  pre .c { color: #94a3b8; }
+  pre .k { color: #f9a8d4; }
+  pre .s { color: #86efac; }
+  .note { border-left: 4px solid var(--fusion); background: #faf5ff; padding: 10px 16px; border-radius: 0 8px 8px 0; margin: 14px 0; }
+  .tag { font-family: monospace; font-size: 12px; background:#e2e8f0; padding: 1px 6px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>From Vector Search → Hybrid Search</h1>
+  <p class="sub">What changed in the LearnMate RAG retrieval pipeline, and why.</p>
+
+  <div class="legend card">
+    <span><span class="dot" style="background:var(--dense)"></span> Dense / vector (meaning)</span>
+    <span><span class="dot" style="background:var(--sparse)"></span> Sparse / BM25 (exact words)</span>
+    <span><span class="dot" style="background:var(--fusion)"></span> RRF fusion (merge)</span>
+    <span><span class="dot" style="background:var(--rerank)"></span> Cross-encoder rerank (precision)</span>
+  </div>
+
+  <!-- ============================================================= -->
+  <h2>1. The one-line idea</h2>
+  <div class="card">
+    <p><b>Before:</b> we found chunks by <i>meaning</i> only (vector search). If the
+    right chunk happened to use different words than the question, the embedding
+    model could rank it low.</p>
+    <p><b>After (hybrid):</b> we <i>also</i> find chunks by <i>exact words</i>
+    (keyword / BM25 search), then <b>merge</b> the two lists. Now a chunk wins if
+    it matches the <i>meaning</i> <u>or</u> the <i>literal terms</i> — ideally both.
+    A final reranker sorts the merged shortlist.</p>
+    <p class="small">Why it matters here: your notes are full of exact tokens like
+    <code>to_thread</code>, <code>384-dim</code>, <code>worker_threads</code>.
+    Meaning-search can blur those; keyword-search nails them.</p>
+  </div>
+
+  <!-- ============================================================= -->
+  <h2>2. Before — vector-only flow</h2>
+  <div class="flow">
+    <div class="node query">User question<small>"how many worker threads in the pool?"</small></div>
+    <div class="arrow"></div>
+    <div class="node dense">Embed query → Vector search<small>Qdrant cosine · top 20</small></div>
+    <div class="arrow"></div>
+    <div class="node rerank">Cross-encoder rerank<small>keep top 5</small></div>
+    <div class="arrow"></div>
+    <div class="node llm">LLM answer<small>chunks stuffed into the prompt</small></div>
+  </div>
+
+  <!-- ============================================================= -->
+  <h2>3. After — hybrid flow</h2>
+  <p>The single recall step splits into <b>two parallel retrievers</b> that are then
+  fused. Everything downstream (rerank → LLM) is unchanged.</p>
+
+  <div class="flow">
+    <div class="node query">User question</div>
+    <div class="arrow"></div>
+
+    <div class="twocol">
+      <div class="branch">
+        <div class="label">Path A · meaning</div>
+        <div class="node dense">Embed → Vector search<small>Qdrant · returns ranked chunk ids</small></div>
+      </div>
+      <div class="branch">
+        <div class="label">Path B · exact words</div>
+        <div class="node sparse">BM25 keyword search<small>over the session's chunks · ranked ids</small></div>
+      </div>
+    </div>
+
+    <div class="arrow"></div>
+    <div class="node fusion">Reciprocal Rank Fusion (RRF)<small>merge the two id lists into one pool of ~20</small></div>
+    <div class="arrow"></div>
+    <div class="node rerank">Cross-encoder rerank<small>reorder the fused pool · keep top 5</small></div>
+    <div class="arrow"></div>
+    <div class="node llm">LLM answer</div>
+  </div>
+
+  <div class="note">
+    <b>Key insight:</b> BM25 needs the <i>whole</i> set of the session's chunks to
+    score against (not just the vector hits) — otherwise it could never surface a
+    chunk that vector search missed. That's exactly why we added
+    <span class="tag">get_session_chunks()</span>: it loads the full corpus once,
+    and that same load also acts as the "do we even have documents?" gate.
+  </div>
+
+  <!-- ============================================================= -->
+  <h2>4. What each new piece does</h2>
+
+  <div class="card">
+    <h3><span class="badge new">NEW</span> &nbsp;<code>app/services/keyword_service.py</code> — BM25</h3>
+    <p>A dependency-free keyword scorer. Given the question's words, it scores every
+    chunk on three intuitions:</p>
+    <table>
+      <tr><th>Rule</th><th>Plain meaning</th><th>Knob</th></tr>
+      <tr><td>Term frequency</td><td>A chunk that uses the query word more is more relevant…</td><td><code>k1</code> (saturation: extra repeats help less and less)</td></tr>
+      <tr><td>Inverse doc frequency (IDF)</td><td>…but rare words (e.g. <code>libuv</code>) count far more than common ones (e.g. "the").</td><td>—</td></tr>
+      <tr><td>Length normalization</td><td>A long chunk naturally contains more words, so we discount its matches.</td><td><code>b</code> (how hard to penalize length)</td></tr>
+    </table>
+  </div>
+
+  <div class="card">
+    <h3><span class="badge new">NEW</span> &nbsp;<code>app/services/hybrid_service.py</code> — RRF + orchestration</h3>
+    <p><code>reciprocal_rank_fusion()</code> merges ranked lists using only each
+    chunk's <b>position</b>, never its raw score. <code>hybrid_rank()</code> ties it
+    together: build BM25 over the session chunks, rank them, then fuse that with the
+    dense ranking.</p>
+  </div>
+
+  <div class="card">
+    <h3><span class="badge changed">CHANGED</span> &nbsp;<code>app/services/rag_service.py</code></h3>
+    <p>Added <code>get_session_chunks()</code> → returns every
+    <code>{chunk_id, text}</code> for the session. Rebuilds <code>chunk_id</code> the
+    same way it's stored in Qdrant (<code>document_id_index</code>) so the two
+    retrievers speak the same id language and can be fused.</p>
+  </div>
+
+  <div class="card">
+    <h3><span class="badge changed">CHANGED</span> &nbsp;<code>app/services/claude_service.py</code></h3>
+    <p>The retrieval block went from <i>one</i> step to the dense + BM25 + RRF
+    sequence above. The gate switched from <code>session_has_documents()</code> to
+    "is <code>get_session_chunks()</code> empty?" (one read does both jobs).</p>
+  </div>
+
+  <div class="card">
+    <h3><span class="badge changed">CHANGED</span> &nbsp;<code>evals/run_eval.py</code></h3>
+    <p>Now scores <b>four</b> configurations so we can measure each piece in
+    isolation: <code>vector only</code>, <code>hybrid only</code>,
+    <code>vector+rerank</code>, <code>hybrid+rerank</code>.</p>
+  </div>
+
+  <!-- ============================================================= -->
+  <h2>5. RRF, worked with real numbers</h2>
+  <p>RRF score for a chunk = sum over each list of <code>1 / (k + rank)</code>, with
+  <code>k = 60</code> and rank starting at 1. A chunk near the top of <i>either</i>
+  list scores well; near the top of <i>both</i> wins. Take this question:</p>
+
+  <div class="card">
+    <p class="small">Question: <i>"Which vector database backs the pipeline, and what distance metric?"</i></p>
+    <table>
+      <tr><th>Chunk</th><th>Dense rank</th><th>BM25 rank</th><th>RRF score</th><th>Fused</th></tr>
+      <tr class="win"><td>c0</td><td>1 → 1/61 = .01639</td><td>2 → 1/62 = .01613</td><td class="num">.03252</td><td>① </td></tr>
+      <tr><td>c2</td><td>3 → 1/63 = .01587</td><td>1 → 1/61 = .01639</td><td class="num">.03226</td><td>②</td></tr>
+      <tr><td>c6</td><td>2 → 1/62 = .01613</td><td>— (absent)</td><td class="num">.01613</td><td>③</td></tr>
+      <tr><td>c7</td><td>— (absent)</td><td>3 → 1/63 = .01587</td><td class="num">.01587</td><td>④</td></tr>
+      <tr><td>c10</td><td>4 → 1/64 = .01563</td><td>— (absent)</td><td class="num">.01563</td><td>⑤</td></tr>
+    </table>
+    <p class="small"><b>Read it:</b> <code>c0</code> wins because it ranked high in
+    <i>both</i> retrievers. <code>c2</code> was only 3rd by meaning but 1st by
+    keywords — fusion rescues it to 2nd overall. Notice RRF never compared the raw
+    cosine (~0.5) against the raw BM25 score (could be 8.9) — those live on totally
+    different scales. It only used <b>ranks</b>, which is what makes it safe to merge
+    two completely different scoring systems.</p>
+  </div>
+
+  <!-- ============================================================= -->
+  <h2>6. The code path, condensed</h2>
+  <pre><span class="c"># app/services/claude_service.py  (inside get_claude_response)</span>
+
+session_chunks = <span class="k">await</span> get_session_chunks(email, session_id)   <span class="c"># full corpus + gate</span>
+<span class="k">if</span> session_chunks:
+    <span class="c"># Path A — dense (meaning). encode = CPU → thread; Qdrant = async I/O → await</span>
+    q_vec       = <span class="k">await</span> asyncio.to_thread(generate_embeddings, user_message)
+    dense_pts   = <span class="k">await</span> search_embeddings(q_vec, email, session_id, top_k=<span class="s">20</span>)
+    dense_ids   = [p.payload[<span class="s">"chunk_id"</span>] <span class="k">for</span> p <span class="k">in</span> dense_pts]
+
+    <span class="c"># Path B + merge — BM25 over the corpus, then RRF (CPU → thread)</span>
+    fused_ids   = <span class="k">await</span> asyncio.to_thread(hybrid_rank, user_message,
+                                          session_chunks, dense_ids, <span class="s">20</span>)
+
+    <span class="c"># Precision — cross-encoder reorders the fused pool, keep best 5</span>
+    candidates  = [point(text_by_id[i]) <span class="k">for</span> i <span class="k">in</span> fused_ids]
+    top5        = <span class="k">await</span> asyncio.to_thread(rerank, user_message, candidates, <span class="s">5</span>)
+
+    document_context = <span class="s">"\n\n"</span>.join(c.payload[<span class="s">"text"</span>] <span class="k">for</span> c <span class="k">in</span> top5)</pre>
+
+  <!-- ============================================================= -->
+  <h2>7. Did it work? (measured)</h2>
+  <table>
+    <tr><th>metric</th><th>vector only</th><th>hybrid only</th><th>vector+rerank</th><th>hybrid+rerank</th></tr>
+    <tr><td>hit@1</td><td class="num">0.650</td><td class="num">0.700</td><td class="num">0.950</td><td class="num">0.950</td></tr>
+    <tr><td>hit@3</td><td class="num">0.850</td><td class="num win">1.000</td><td class="num">1.000</td><td class="num">1.000</td></tr>
+    <tr><td>mrr</td><td class="num">0.768</td><td class="num win">0.850</td><td class="num">0.975</td><td class="num">0.975</td></tr>
+  </table>
+  <p><b>Hybrid clearly improves recall</b> (vector-only → hybrid-only: hit@3 .85 → 1.00,
+  MRR .768 → .850). After reranking the two tie — but only because this tiny 13-chunk
+  test corpus fits entirely inside the 20-candidate pool, so the reranker sees the
+  same chunks either way. On a real corpus (pool ≪ total), hybrid's better recall
+  would feed the reranker better candidates and carry through to the final answer.</p>
+
+  <p class="small" style="margin-top:40px; text-align:center;">LearnMate RAG · hybrid search explainer · open in any browser</p>
+
+</div>
+</body>
+</html>

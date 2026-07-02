@@ -58,7 +58,7 @@ async def message(
     for file in attachments:
         result = await process_uploaded_file(file)
         
-        att_id = str(uuid.uuid4())
+        att_id = str(uuid4())
         
         if result.get("type") == "document":
             document = await save_document_metadata(
@@ -91,19 +91,14 @@ async def message(
                 "base64": result.get("base64"),
             })
     
-    attachment_texts = "\n\n".join(
-        f"[Attached file: {att['filename']}]\n{att.get('text', '')}"
-        for att in processed_attachments
-        if att.get("text")
-    )
-    
-    user_message_with_context = message
-    if attachment_texts:
-        user_message_with_context = f"{message}\n\n{attachment_texts}"
-    
+    # We deliberately do NOT staple the extracted file text onto the user
+    # message. The document is already indexed for retrieval above, so the
+    # model receives its content through RAG (see get_claude_response). Inlining
+    # the raw text here would also leak the entire file dump into the visible
+    # user bubble when the frontend reloads chat history.
     claude_response = await get_claude_response(
         session_id=session_id,
-        user_message=user_message_with_context,
+        user_message=message,
         current_user_email=current_user.email,
         attachments=processed_attachments if processed_attachments else None,
     )
