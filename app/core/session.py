@@ -78,20 +78,43 @@ async def get_session(session_id: str, current_user_email: str) -> list:
             "content": message.get("content"),
             "sent_at": message.get("sent_at"),
             "attachments": message.get("attachments", []),
+            # Present only on assistant messages that carried them; .get() yields
+            # None for older messages, which the optional schema fields accept.
+            "notion_urls": message.get("notion_urls"),
+            "notion_pages": message.get("notion_pages"),
+            "sources": message.get("sources"),
         }
         for message in doc.get("messages", [])
     ]
 
 
-async def add_message(session_id: str, role: str, content: str, current_user_email: str, attachments: list[dict] | None = None):
+async def add_message(
+    session_id: str,
+    role: str,
+    content: str,
+    current_user_email: str,
+    attachments: list[dict] | None = None,
+    notion_urls: list[str] | None = None,
+    notion_pages: list[dict] | None = None,
+    sources: list[dict] | None = None,
+):
     now = datetime.now(timezone.utc)
     message_doc = {
         "role": role,
         "content": content,
         "sent_at": now,
     }
+    # Only attach fields that were actually provided, so user messages stay lean
+    # and assistant messages persist their citations / Notion links.
     if attachments is not None:
         message_doc["attachments"] = attachments
+    if notion_urls is not None:
+        message_doc["notion_urls"] = notion_urls
+    if notion_pages is not None:
+        message_doc["notion_pages"] = notion_pages
+    if sources is not None:
+        message_doc["sources"] = sources
+
     result = await chats_collection.update_one(
         {"_id": session_id, "user_email": current_user_email},
         {
@@ -101,6 +124,28 @@ async def add_message(session_id: str, role: str, content: str, current_user_ema
     )
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail=CHAT_NOT_FOUND)
+
+
+async def update_last_message(session_id: str, current_user_email: str, fields: dict):
+    # Set fields on the most recently pushed message. Used to attach Notion links
+    # to the assistant reply after note generation finishes (the links aren't
+    # known when the message is first saved).
+    doc = await chats_collection.find_one(
+        {"_id": session_id, "user_email": current_user_email},
+        projection={"messages": 1},
+    )
+    if not doc:
+        return
+    messages = doc.get("messages", [])
+    if not messages:
+        return
+
+    idx = len(messages) - 1
+    set_ops = {f"messages.{idx}.{key}": value for key, value in fields.items()}
+    await chats_collection.update_one(
+        {"_id": session_id, "user_email": current_user_email},
+        {"$set": set_ops},
+    )
 
 
 async def clear_session(session_id: str, current_user_email: str):

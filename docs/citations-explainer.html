@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Citation Generation + Grounding — LearnMate RAG</title>
+<style>
+  :root {
+    --retrieve: #2563eb;  --number: #7c3aed;  --llm: #0f766e;
+    --validate: #ea580c;  --return: #059669;
+    --ink: #1e293b; --muted: #64748b; --line: #cbd5e1; --bg: #f8fafc; --card: #fff;
+  }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: var(--ink); background: var(--bg); margin: 0; line-height: 1.6; }
+  .wrap { max-width: 940px; margin: 0 auto; padding: 40px 24px 80px; }
+  h1 { font-size: 30px; margin: 0 0 6px; }
+  h2 { font-size: 22px; margin: 46px 0 14px; padding-bottom: 8px; border-bottom: 2px solid var(--line); }
+  h3 { font-size: 17px; margin: 24px 0 8px; }
+  .sub { color: var(--muted); font-size: 16px; margin-top: 0; }
+  code { background: #eef2ff; color: #3730a3; padding: 1px 6px; border-radius: 5px; font-size: 0.9em; }
+  p { margin: 10px 0; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+    padding: 16px 20px; margin: 14px 0; box-shadow: 0 1px 2px rgba(0,0,0,.04); }
+  .flow { display: flex; flex-direction: column; align-items: center; margin: 22px 0; }
+  .node { border-radius: 10px; padding: 11px 18px; text-align: center; font-weight: 600;
+    color: #fff; min-width: 340px; box-shadow: 0 2px 6px rgba(0,0,0,.12); }
+  .node small { display: block; font-weight: 400; opacity: .93; font-size: 12px; margin-top: 3px; }
+  .node.retrieve { background: var(--retrieve); }
+  .node.number { background: var(--number); }
+  .node.llm { background: var(--llm); }
+  .node.validate { background: var(--validate); }
+  .node.return { background: var(--return); }
+  .arrow { width: 2px; height: 22px; background: var(--line); position: relative; }
+  .arrow::after { content: "▼"; position: absolute; bottom: -6px; left: -5px; color: var(--line); font-size: 11px; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 14px; }
+  th, td { border: 1px solid var(--line); padding: 8px 10px; text-align: left; vertical-align: top; }
+  th { background: #f1f5f9; }
+  .badge { display: inline-block; font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 999px; color: #fff; }
+  .badge.new { background: #059669; } .badge.changed { background: #2563eb; }
+  pre { background: #0f172a; color: #e2e8f0; padding: 14px 16px; border-radius: 10px; overflow-x: auto; font-size: 13px; line-height: 1.5; }
+  pre .c { color: #94a3b8; } pre .k { color: #f9a8d4; } pre .s { color: #86efac; } pre .n { color: #fca5a5; }
+  .note { border-left: 4px solid var(--number); background: #faf5ff; padding: 10px 16px; border-radius: 0 8px 8px 0; margin: 14px 0; }
+  .small { font-size: 13px; color: var(--muted); }
+  ins { background: #ecfdf5; text-decoration: none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Citation Generation + Grounding</h1>
+  <p class="sub">Making answers traceable to their source chunks — what we added and changed.</p>
+
+  <!-- ===================================================== -->
+  <h2>1. What & why</h2>
+  <div class="card">
+    <p><b>Citation generation</b> = the answer comes back <i>with its receipts</i>: the
+    specific source chunks it was based on, so the user can verify instead of trusting blindly.</p>
+    <p><b>Grounding</b> = instructing the model to answer <i>only</i> from those sources
+    (and admit when it can't), rather than from its own memory.</p>
+    <p class="small">Together they turn "here's an answer" into "here's an answer, based on
+    <i>these</i> passages from <i>your</i> notes" — the single biggest trust win for a learning tool,
+    and a direct reducer of (perceived and real) hallucination.</p>
+  </div>
+
+  <!-- ===================================================== -->
+  <h2>2. The flow</h2>
+  <div class="flow">
+    <div class="node retrieve">Retrieve (hybrid + rerank)<small>top-5 chunks, each still carrying its chunk_id</small></div>
+    <div class="arrow"></div>
+    <div class="node number">Number the context + resolve filenames<small>[1] (from notes.pdf) &lt;text&gt; … one Mongo lookup for names</small></div>
+    <div class="arrow"></div>
+    <div class="node llm">LLM answers with grounding instruction<small>"use ONLY these sources; cite them inline with [n]"</small></div>
+    <div class="arrow"></div>
+    <div class="node validate">Validate [n] markers<small>flag which in-range sources were actually cited</small></div>
+    <div class="arrow"></div>
+    <div class="node return">Return answer + sources[]<small>each with filename, snippet, cited flag</small></div>
+  </div>
+  <div class="note">
+    <b>Key link:</b> the <code>[n]</code> the model writes and the <code>id</code> in the
+    <code>sources</code> array come from the <b>same enumeration</b> — the numbered context block
+    and the source list are built in one loop, so <code>[2]</code> in the answer always maps to
+    <code>sources[id=2]</code>.
+  </div>
+
+  <!-- ===================================================== -->
+  <h2>3. What changed, file by file</h2>
+
+  <div class="card">
+    <h3><span class="badge changed">CHANGED</span> &nbsp;<code>models/schema.py</code></h3>
+    <p>New <code>Source</code> model; <code>sources: list[Source] = []</code> added to
+    <code>ChatResponse</code> and <code>LearnResponse</code>. Fields:
+    <code>id</code>, <code>chunk_id</code>, <code>document_id</code>, <code>filename</code>,
+    <code>snippet</code>, <code>cited</code>.</p>
+  </div>
+
+  <div class="card">
+    <h3><span class="badge changed">CHANGED</span> &nbsp;<code>services/rag_service.py</code></h3>
+    <p>New <code>get_document_filenames(document_ids)</code> — one Mongo lookup mapping
+    <code>document_id → filename</code> (dedupes ids first, ignores invalid ObjectIds).</p>
+  </div>
+
+  <div class="card">
+    <h3><span class="badge changed">CHANGED</span> &nbsp;<code>services/claude_service.py</code> (the core)</h3>
+    <table>
+      <tr><th>Step</th><th>What it does</th></tr>
+      <tr><td>Keep identity</td><td>Retrieval keeps <code>(chunk_id, text)</code> per chunk instead of flattening to one blob.</td></tr>
+      <tr><td>Number context</td><td>Builds <code>[i] (from filename)\n&lt;text&gt;</code> blocks — the model sees numbered sources.</td></tr>
+      <tr><td>Grounding prompt</td><td>Adds "answer ONLY from these numbered sources; if absent, say so; cite inline with [n]".</td></tr>
+      <tr><td>Build sources[]</td><td>Same loop emits the source list (id, filename, 300-char snippet, <code>cited: false</code>).</td></tr>
+      <tr><td>Validate citations</td><td>After the reply, marks <code>cited: true</code> for in-range <code>[n]</code> the model used.</td></tr>
+      <tr><td>Return</td><td>Now returns <code>(reply, sources)</code> instead of just <code>reply</code>.</td></tr>
+    </table>
+  </div>
+
+  <div class="card">
+    <h3><span class="badge changed">CHANGED</span> &nbsp;<code>api/chat.py</code> &amp; <code>api/learn.py</code></h3>
+    <p>Both <code>/message</code> handlers unpack <code>(reply, sources)</code> and pass
+    <code>sources</code> into the response.</p>
+  </div>
+
+  <!-- ===================================================== -->
+  <h2>4. Before → after (API response)</h2>
+  <pre><span class="c">// before</span>
+{ <span class="s">"response"</span>: <span class="s">"Use asyncio.to_thread for CPU-bound work."</span>,
+  <span class="s">"session_id"</span>: <span class="s">"abc"</span> }
+
+<span class="c">// after</span>
+{ <span class="s">"response"</span>: <span class="s">"Use asyncio.to_thread for CPU-bound work [1]. BM25 is lexical [2]."</span>,
+  <span class="s">"session_id"</span>: <span class="s">"abc"</span>,
+  <span class="s">"sources"</span>: [
+    { <span class="s">"id"</span>: 1, <span class="s">"filename"</span>: <span class="s">"async-notes.pdf"</span>, <span class="s">"chunk_id"</span>: <span class="s">"6a34…3536_4"</span>,
+      <span class="s">"snippet"</span>: <span class="s">"CPU work like encode needs a separate thread…"</span>, <span class="s">"cited"</span>: <span class="k">true</span> },
+    { <span class="s">"id"</span>: 2, <span class="s">"filename"</span>: <span class="s">"bm25.pdf"</span>, <span class="s">"chunk_id"</span>: <span class="s">"6a36…39e7_0"</span>,
+      <span class="s">"snippet"</span>: <span class="s">"BM25 rewards chunks containing the query's actual words…"</span>, <span class="s">"cited"</span>: <span class="k">true</span> }
+  ] }</pre>
+
+  <!-- ===================================================== -->
+  <h2>5. Design decisions worth remembering</h2>
+  <div class="card">
+    <table>
+      <tr><th>Decision</th><th>Why</th></tr>
+      <tr>
+        <td><b>Don't strip <code>[n]</code> from the answer text</b></td>
+        <td>This is a <i>coding</i> tool — <code>arr[2]</code> / <code>list[0]</code> are legitimate. We only <i>read</i> markers to set the <code>cited</code> flag; we never mutate the text, so code is never corrupted.</td>
+      </tr>
+      <tr>
+        <td><b>Only in-range numbers count</b></td>
+        <td>With 5 sources, <code>[9]</code> is ignored — it's either a hallucinated citation or code. Out-of-range never flips a <code>cited</code> flag.</td>
+      </tr>
+      <tr>
+        <td><b>Grounding scoped to "uploaded material"</b></td>
+        <td>A hard global "answer only from context" would break the intake conversation (which is a general chat to build the curriculum). We scope it to questions <i>about the documents</i>.</td>
+      </tr>
+      <tr>
+        <td><b>Keep all sources, flag <code>cited</code></b></td>
+        <td>We return every retrieved source (not just cited ones) so nothing is hidden, but mark which the model used so the UI can emphasize them.</td>
+      </tr>
+      <tr>
+        <td><b>Backward compatible</b></td>
+        <td><code>sources</code> defaults to <code>[]</code>; empty on plain-chat turns and on the notes-generation path. Old frontends ignoring it keep working.</td>
+      </tr>
+    </table>
+  </div>
+
+  <div class="note">
+    <b>Known limitation (false positive):</b> if the answer contains real code like
+    <code>arr[2]</code> <i>and</i> there is a source #2, that source gets flagged
+    <code>cited</code> even if the code wasn't a citation. This is intentional — a harmless
+    over-flag is far better than corrupting code by stripping brackets. If it ever matters, a
+    distinctive citation token (e.g. <code>[[2]]</code>) would remove the ambiguity.
+  </div>
+
+  <p class="small" style="margin-top:40px; text-align:center;">LearnMate RAG · citations + grounding · open in any browser</p>
+</div>
+</body>
+</html>

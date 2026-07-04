@@ -49,6 +49,26 @@ async def save_document_metadata(
     return SimpleNamespace(**document)
 
 
+async def get_document_filenames(document_ids: list[str]) -> dict:
+    # Map document_id -> filename, for turning retrieved chunk ids into
+    # human-readable citation sources. Ignores ids that aren't valid ObjectIds.
+    object_ids = []
+    for d in document_ids:
+        try:
+            object_ids.append(ObjectId(d))
+        except Exception:
+            continue
+
+    if not object_ids:
+        return {}
+
+    cursor = documents_metadata_collection.find(
+        {"_id": {"$in": object_ids}},
+        projection={"filename": 1},
+    )
+    return {str(doc["_id"]): doc.get("filename") async for doc in cursor}
+
+
 async def delete_session_documents(user_email: str, session_id: str | None) -> dict:
     # Remove a session's uploaded documents everywhere they live: chunk rows and
     # metadata in Mongo, and vectors in Qdrant. Without this, resetting a session

@@ -4,7 +4,7 @@ from app.models.schema import ChatRequest, LearnResponse
 from app.services.claude_service import get_claude_response, generate_curriculum_ai
 from app.services.note_generator import generate_note
 from app.services.notion_service import create_notion_topic, create_user_parent_page
-from app.core.session import get_context, get_chat
+from app.core.session import get_context, get_chat, update_last_message
 from app.core.security import get_current_user
 from app.models.user import TokenData
 from app.database import users_collection
@@ -30,6 +30,7 @@ async def generate_learning_notes(session_id: str, user_email: str) -> dict:
         return {
             "status": "chatting",
             "notion_urls": [],
+            "notion_pages": [],
         }
 
     user_doc = await users_collection.find_one({"email": user_email})
@@ -54,17 +55,18 @@ async def generate_learning_notes(session_id: str, user_email: str) -> dict:
         notion_token = settings.notion_api_key
         notion_parent_page_id = settings.notion_parent_page_id
 
-    topics = get_cached_curriculum(known_stack, target_tech)
+    topics = await get_cached_curriculum(known_stack, target_tech)
     if not topics:
         topics = await generate_curriculum_ai(known_stack, target_tech)
-        set_cached_curriculum(known_stack, target_tech, topics)
+        await set_cached_curriculum(known_stack, target_tech, topics)
 
     urls = []
+    notion_pages = []
     for topic in topics:
-        note_content = get_cached_note(topic, known_stack, target_tech)
+        note_content = await get_cached_note(topic, known_stack, target_tech)
         if not note_content:
             note_content = await generate_note(topic, known_stack, target_tech)
-            set_cached_note(topic, known_stack, target_tech, note_content)
+            await set_cached_note(topic, known_stack, target_tech, note_content)
 
         url = await create_notion_topic(
             title=topic,
@@ -74,10 +76,20 @@ async def generate_learning_notes(session_id: str, user_email: str) -> dict:
             page_id=notion_parent_page_id,
         )
         urls.append(url)
+        notion_pages.append({"title": topic, "url": url})
+
+    # Persist the links onto the assistant message that triggered generation, so
+    # they survive a reload (they aren't known when that message is first saved).
+    await update_last_message(
+        session_id,
+        user_email,
+        {"notion_urls": urls, "notion_pages": notion_pages},
+    )
 
     return {
         "status": "completed",
         "notion_urls": urls,
+        "notion_pages": notion_pages,
     }
 
 
@@ -87,14 +99,15 @@ async def learn(
     session_id: str = Header(...),
     current_user: TokenData = Depends(get_current_user)
 ):
-    response = await get_claude_response(session_id, request.message, current_user.email)
+    response, sources = await get_claude_response(session_id, request.message, current_user.email)
 
     if "READY_TO_GENERATE" not in response.upper():
         return LearnResponse(
             response=response,
             session_id=session_id,
             status="chatting",
-            notion_urls=[]
+            notion_urls=[],
+            sources=sources,
         )
 
     result = await generate_learning_notes(session_id, current_user.email)
@@ -104,4 +117,5 @@ async def learn(
         session_id=session_id,
         status=result["status"],
         notion_urls=result["notion_urls"],
+        notion_pages=result.get("notion_pages", []),
     )

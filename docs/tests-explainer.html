@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Test Suite — LearnMate RAG</title>
+<style>
+  :root { --ink:#1e293b; --muted:#64748b; --line:#cbd5e1; --bg:#f8fafc; --card:#fff; --green:#059669; --blue:#2563eb; }
+  * { box-sizing:border-box; }
+  body { font-family:-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; color:var(--ink); background:var(--bg); margin:0; line-height:1.6; }
+  .wrap { max-width:940px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:30px; margin:0 0 6px; } h2 { font-size:21px; margin:40px 0 12px; padding-bottom:8px; border-bottom:2px solid var(--line); }
+  .sub { color:var(--muted); font-size:16px; margin-top:0; }
+  code { background:#eef2ff; color:#3730a3; padding:1px 6px; border-radius:5px; font-size:.9em; }
+  p { margin:10px 0; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px 20px; margin:14px 0; box-shadow:0 1px 2px rgba(0,0,0,.04); }
+  table { border-collapse:collapse; width:100%; margin:10px 0; font-size:14px; }
+  th,td { border:1px solid var(--line); padding:8px 10px; text-align:left; vertical-align:top; }
+  th { background:#f1f5f9; }
+  .count { display:inline-block; background:var(--green); color:#fff; font-weight:700; border-radius:999px; padding:1px 9px; font-size:13px; }
+  pre { background:#0f172a; color:#e2e8f0; padding:14px 16px; border-radius:10px; overflow-x:auto; font-size:13px; line-height:1.5; }
+  pre .c { color:#94a3b8; } pre .g { color:#86efac; }
+  .note { border-left:4px solid var(--blue); background:#eff6ff; padding:10px 16px; border-radius:0 8px 8px 0; margin:14px 0; }
+  .small { font-size:13px; color:var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Test Suite</h1>
+  <p class="sub">33 unit tests guarding the core RAG logic — added before the SSE refactor as a safety net.</p>
+
+  <div class="card">
+    <p><b>Why now:</b> the streaming (SSE) change rewrites <code>get_claude_response</code> into an async
+    generator and reorders its post-processing — exactly the kind of refactor that breaks things silently.
+    These tests characterize the current behaviour so any regression during that refactor lights up immediately.</p>
+    <p class="small">Run with <code>python -m pytest</code>. All tests are synchronous and need no live
+    Mongo / Qdrant / Groq — only the MiniLM tokenizer loads (once).</p>
+  </div>
+
+  <h2>What's covered</h2>
+
+  <div class="card">
+    <h3><code>test_keyword_service.py</code> &nbsp;<span class="count">11</span></h3>
+    <p>BM25 keyword scoring + the per-session BM25 cache — the sparse half of hybrid search.</p>
+    <table>
+      <tr><th>Test</th><th>Guards that…</th></tr>
+      <tr><td>tokenize keeps underscores</td><td><code>to_thread</code> stays one token, not split</td></tr>
+      <tr><td>doc with term scores &gt; without</td><td>BM25 rewards containing the query word</td></tr>
+      <tr><td>rare term &gt; common term</td><td>IDF weighting — rare words matter more</td></tr>
+      <tr><td>empty corpus / absent term</td><td>no crash, returns zeros</td></tr>
+      <tr><td>cache hit returns same object</td><td>the index is reused, not rebuilt per query</td></tr>
+      <tr><td>rebuild on corpus change</td><td>adding a doc changes the signature → rebuild</td></tr>
+      <tr><td>no session_id → no caching</td><td>eval / one-off calls don't leak into the cache</td></tr>
+      <tr><td>invalidate removes entry</td><td>deleting docs drops the stale index</td></tr>
+      <tr><td>ids align with corpus order</td><td>score index → chunk id mapping stays correct</td></tr>
+    </table>
+  </div>
+
+  <div class="card">
+    <h3><code>test_hybrid_service.py</code> &nbsp;<span class="count">8</span></h3>
+    <p>Reciprocal Rank Fusion + <code>hybrid_rank</code> — how dense and sparse results are merged.</p>
+    <table>
+      <tr><th>Test</th><th>Guards that…</th></tr>
+      <tr><td>in both lists beats in one</td><td>RRF rewards agreement across retrievers</td></tr>
+      <tr><td>rank beats raw-score scale</td><td>RRF uses position only — safe to merge cosine + BM25</td></tr>
+      <tr><td>single list / empty input</td><td>degenerate cases don't break</td></tr>
+      <tr><td>surfaces keyword match dense missed</td><td>the whole point of hybrid: BM25 rescues a chunk vectors ranked last</td></tr>
+      <tr><td>respects pool size / valid ids</td><td>output is bounded and references real chunks</td></tr>
+    </table>
+  </div>
+
+  <div class="card">
+    <h3><code>test_chunk_service.py</code> &nbsp;<span class="count">5</span></h3>
+    <p>Token-based chunking — the 256-token fix that started the whole cleanup.</p>
+    <table>
+      <tr><th>Test</th><th>Guards that…</th></tr>
+      <tr><td>every chunk ≤ 256 tokens</td><td>chunks never exceed the embedding model's window (the original bug)</td></tr>
+      <tr><td>overlap ≥ chunk_size raises</td><td>invalid config fails loudly</td></tr>
+      <tr><td>tiny text dropped</td><td>&lt;50-token fragments are skipped</td></tr>
+      <tr><td>long text → many chunks / nonempty</td><td>chunking actually splits and yields clean strings</td></tr>
+    </table>
+  </div>
+
+  <div class="card">
+    <h3><code>test_claude_helpers.py</code> &nbsp;<span class="count">9</span></h3>
+    <p>The grounding + prompt-injection guard, and citation marking.</p>
+    <table>
+      <tr><th>Test</th><th>Guards that…</th></tr>
+      <tr><td>guard has grounding instruction</td><td>"answer ONLY from sources / no outside knowledge" is present</td></tr>
+      <tr><td>guard has injection instruction</td><td>"UNTRUSTED / NEVER follow" is present</td></tr>
+      <tr><td>matching random fence wraps body</td><td>open/close tokens match and the context sits inside</td></tr>
+      <tr><td>fence is random per call</td><td>the token can't be predicted/forged by an upload</td></tr>
+      <tr><td>oversized context truncated</td><td><code>MAX_CONTEXT_CHARS</code> cap is enforced</td></tr>
+      <tr><td>in-range [n] flagged cited</td><td>real citations mark their source</td></tr>
+      <tr><td>out-of-range arr[9] ignored</td><td>code that looks like a citation isn't counted</td></tr>
+      <tr><td>empty sources / None reply safe</td><td>no crash on edge inputs</td></tr>
+    </table>
+  </div>
+
+  <h2>A test earned its keep on day one</h2>
+  <div class="note">
+    The first version of <code>test_guard_wraps_context_in_matching_fence</code> assumed the fence token
+    appeared <b>twice</b>. It actually appears <b>four</b> times — twice in the instruction prose
+    ("the text between &lt;ctx-…&gt; and &lt;/ctx-…&gt;") plus the two real fence tags. The failing test forced
+    the assertion to check the <i>real</i> property: all tokens identical + body wrapped in a matching fence.
+    That's tests catching a wrong assumption before it becomes a wrong belief.
+  </div>
+
+  <h2>Scope — and what's next</h2>
+  <div class="card">
+    <p><b>These are unit tests</b> for pure logic (the RAG algorithms + guard/citation helpers). To make the
+    citation logic testable, <code>mark_cited_sources</code> was extracted from <code>get_claude_response</code>
+    (same behaviour, now isolated) — which also leaves that function cleaner for the SSE rewrite.</p>
+    <p><b>Not yet covered (a future second layer):</b> integration / endpoint tests — auth flow, file upload,
+    the <code>/message</code> request contract, and DB cleanup on reset. Those need mocked clients or a test
+    database and are a bigger effort. The unit layer here is the one that actually protects the SSE refactor.</p>
+  </div>
+
+  <pre><span class="c"># run everything</span>
+python -m pytest
+<span class="g">33 passed in ~14s</span></pre>
+
+  <p class="small" style="margin-top:40px; text-align:center;">LearnMate RAG · test suite · open in any browser</p>
+</div>
+</body>
+</html>

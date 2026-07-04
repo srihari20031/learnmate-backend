@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>SSE Streaming — How It Works — LearnMate RAG</title>
+<style>
+  :root {
+    --retrieve:#2563eb; --stream:#7c3aed; --buffer:#ea580c; --endpoint:#0f766e; --done:#059669;
+    --ink:#1e293b; --muted:#64748b; --line:#cbd5e1; --bg:#f8fafc; --card:#fff;
+  }
+  * { box-sizing:border-box; }
+  body { font-family:-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; color:var(--ink); background:var(--bg); margin:0; line-height:1.65; }
+  .wrap { max-width:960px; margin:0 auto; padding:40px 24px 90px; }
+  h1 { font-size:30px; margin:0 0 6px; }
+  h2 { font-size:22px; margin:48px 0 14px; padding-bottom:8px; border-bottom:2px solid var(--line); }
+  h3 { font-size:17px; margin:24px 0 8px; }
+  .sub { color:var(--muted); font-size:16px; margin-top:0; }
+  code { background:#eef2ff; color:#3730a3; padding:1px 6px; border-radius:5px; font-size:.9em; }
+  p { margin:10px 0; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px 20px; margin:14px 0; box-shadow:0 1px 2px rgba(0,0,0,.04); }
+  .step { display:inline-block; width:26px; height:26px; border-radius:50%; color:#fff; text-align:center; line-height:26px; font-weight:700; font-size:14px; margin-right:8px; }
+  .s1{background:var(--retrieve)} .s2{background:var(--stream)} .s3{background:var(--buffer)} .s4{background:var(--endpoint)} .s5{background:var(--done)}
+  table { border-collapse:collapse; width:100%; margin:12px 0; font-size:14px; }
+  th,td { border:1px solid var(--line); padding:8px 10px; text-align:left; vertical-align:top; }
+  th { background:#f1f5f9; }
+  pre { background:#0f172a; color:#e2e8f0; padding:15px 17px; border-radius:10px; overflow-x:auto; font-size:12.5px; line-height:1.55; }
+  pre .c{color:#94a3b8} pre .k{color:#f9a8d4} pre .s{color:#86efac} pre .f{color:#93c5fd} pre .n{color:#fca5a5} pre .y{color:#fcd34d}
+  .flow { display:flex; flex-direction:column; align-items:center; margin:22px 0; }
+  .node { border-radius:10px; padding:11px 18px; text-align:center; font-weight:600; color:#fff; min-width:360px; box-shadow:0 2px 6px rgba(0,0,0,.12); }
+  .node small { display:block; font-weight:400; opacity:.93; font-size:12px; margin-top:3px; }
+  .arrow { width:2px; height:22px; background:var(--line); position:relative; }
+  .arrow::after { content:"▼"; position:absolute; bottom:-6px; left:-5px; color:var(--line); font-size:11px; }
+  .note { border-left:4px solid var(--stream); background:#faf5ff; padding:10px 16px; border-radius:0 8px 8px 0; margin:14px 0; }
+  .warn { border-left:4px solid var(--buffer); background:#fff7ed; padding:10px 16px; border-radius:0 8px 8px 0; margin:14px 0; }
+  .small { font-size:13px; color:var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Server-Sent Events — How the Streaming Works</h1>
+  <p class="sub">A code walkthrough of the <code>/api/chat/message/stream</code> endpoint.</p>
+
+  <!-- ============================================================= -->
+  <h2>1. The problem &amp; the idea</h2>
+  <div class="card">
+    <p><b>Before:</b> the browser sends a request and waits for the <i>entire</i> answer
+    to finish generating (several seconds) before it sees a single word — one request,
+    one big JSON response.</p>
+    <p><b>With SSE:</b> the server keeps the HTTP connection open and pushes many small
+    <b>events</b> down it as the model produces tokens. Same total time, but the user
+    sees text appear <i>as it's typed</i>. SSE is just a long-lived HTTP response with a
+    special content type (<code>text/event-stream</code>) and a simple text format:
+    each event is <code>data: {json}</code> followed by a blank line.</p>
+  </div>
+
+  <!-- ============================================================= -->
+  <h2>2. The flow</h2>
+  <div class="flow">
+    <div class="node" style="background:var(--retrieve)"><span class="step s1">1</span>Retrieve (hybrid + rerank)<small>runs once, up front — sources are known before any token</small></div>
+    <div class="arrow"></div>
+    <div class="node" style="background:var(--stream)"><span class="step s2">2</span>Stream tokens from Groq<small>async generator yields "delta" events as the model types</small></div>
+    <div class="arrow"></div>
+    <div class="node" style="background:var(--buffer)"><span class="step s3">3</span>Tail-buffer filters the sentinel<small>suppresses READY_TO_GENERATE so it never leaks</small></div>
+    <div class="arrow"></div>
+    <div class="node" style="background:var(--done)"><span class="step s5">4</span>"done" event<small>final text, cited flags, notion_urls</small></div>
+  </div>
+
+  <!-- ============================================================= -->
+  <h2>3. The event format</h2>
+  <p>Every event is one small helper away. Each is a JSON object on a <code>data:</code>
+  line, ending in a blank line — and each carries a <code>type</code> the frontend
+  switches on.</p>
+
+  <pre><span class="k">def</span> <span class="f">_sse</span>(payload: <span class="k">dict</span>) -> <span class="k">str</span>:
+    <span class="c"># One Server-Sent Event: a JSON object on a `data:` line. Each event has a</span>
+    <span class="c"># "type" (sources | delta | status | done | error) the frontend switches on.</span>
+    <span class="k">return</span> <span class="s">f"data: {json.dumps(payload)}\n\n"</span></pre>
+
+  <table>
+    <tr><th>Event</th><th>Payload</th><th>Frontend does…</th></tr>
+    <tr><td><code>sources</code></td><td><code>{sources: [...]}</code></td><td>render citation chips (sent first)</td></tr>
+    <tr><td><code>delta</code></td><td><code>{text: "..."}</code></td><td><b>append</b> to the live bubble</td></tr>
+    <tr><td><code>status</code></td><td><code>{status: "generating_notes"}</code></td><td>show a spinner</td></tr>
+    <tr><td><code>done</code></td><td><code>{response, status, notion_urls, sources}</code></td><td>finalize the message</td></tr>
+    <tr><td><code>error</code></td><td><code>{message: "..."}</code></td><td>show an error</td></tr>
+  </table>
+
+  <!-- ============================================================= -->
+  <h2>4. The async generator (the heart of it)</h2>
+  <p>A normal function <code>return</code>s once. An <b>async generator</b>
+  <code>yield</code>s many values over time, and <code>await</code>s in between — perfect
+  for "produce an event, wait for the next token, produce another." FastAPI streams each
+  <code>yield</code>ed string straight to the client.</p>
+
+  <pre><span class="k">async def</span> <span class="f">get_claude_response_stream</span>(session_id, user_message, current_user_email, attachments=<span class="k">None</span>):
+    <span class="c"># Same pipeline as the blocking version — but the LLM output streams.</span>
+    document_context, sources = <span class="k">await</span> <span class="f">retrieve_context_and_sources</span>(
+        session_id, current_user_email, user_message)
+
+    <span class="c"># (1) Sources are known before generation, so send them up front.</span>
+    <span class="k">yield</span> <span class="f">_sse</span>({<span class="s">"type"</span>: <span class="s">"sources"</span>, <span class="s">"sources"</span>: sources})
+
+    <span class="k">await</span> <span class="f">add_message</span>(session_id, <span class="s">"user"</span>, user_message, current_user_email, attachments=attachments)
+    history  = <span class="k">await</span> <span class="f">get_session</span>(session_id, current_user_email)
+    messages = <span class="f">build_llm_messages</span>(history, document_context)   <span class="c"># + grounding/injection guard</span>
+
+    <span class="c"># (2) stream=True -> Groq returns an async iterator of token chunks.</span>
+    stream = <span class="k">await</span> client.chat.completions.<span class="f">create</span>(model=MODEL, messages=messages, stream=<span class="k">True</span>)
+
+    hold, full_raw, pending = <span class="k">len</span>(SENTINEL) - <span class="y">1</span>, <span class="s">""</span>, <span class="s">""</span>
+
+    <span class="k">async for</span> chunk <span class="k">in</span> stream:
+        delta = chunk.choices[<span class="y">0</span>].delta.content <span class="k">or</span> <span class="s">""</span>
+        <span class="k">if not</span> delta: <span class="k">continue</span>
+        full_raw += delta
+        pending  += delta
+
+        <span class="c"># (3) tail-buffer: strip any full sentinel, hold back a short tail (see below)</span>
+        cleaned = re.<span class="f">sub</span>(SENTINEL, <span class="s">""</span>, pending, flags=re.IGNORECASE)
+        <span class="k">if</span> <span class="k">len</span>(cleaned) > hold:
+            emit, pending = cleaned[:-hold], cleaned[-hold:]
+            <span class="k">if</span> emit:
+                <span class="k">yield</span> <span class="f">_sse</span>({<span class="s">"type"</span>: <span class="s">"delta"</span>, <span class="s">"text"</span>: emit})
+        <span class="k">else</span>:
+            pending = cleaned
+
+    <span class="c"># flush the held tail (any trailing sentinel removed)</span>
+    tail = re.<span class="f">sub</span>(SENTINEL, <span class="s">""</span>, pending, flags=re.IGNORECASE)
+    <span class="k">if</span> tail:
+        <span class="k">yield</span> <span class="f">_sse</span>({<span class="s">"type"</span>: <span class="s">"delta"</span>, <span class="s">"text"</span>: tail})
+
+    <span class="c"># (4) post-processing — mirrors the non-streaming path</span>
+    reply = full_raw
+    <span class="f">mark_cited_sources</span>(reply, sources)                <span class="c"># flag which sources got [n]</span>
+    display_reply = <span class="f">strip_sentinel</span>(reply)
+    <span class="k">await</span> <span class="f">add_message</span>(session_id, <span class="s">"assistant"</span>, display_reply, current_user_email)
+    <span class="k">await</span> <span class="f">_maybe_extract_context</span>(session_id, history, current_user_email)
+
+    <span class="k">if</span> SENTINEL.<span class="f">upper</span>() <span class="k">in</span> reply.<span class="f">upper</span>():          <span class="c"># model is ready -> build notes as a final phase</span>
+        <span class="k">yield</span> <span class="f">_sse</span>({<span class="s">"type"</span>: <span class="s">"status"</span>, <span class="s">"status"</span>: <span class="s">"generating_notes"</span>})
+        <span class="k">from</span> app.api.learn <span class="k">import</span> generate_learning_notes  <span class="c"># deferred: avoids circular import</span>
+        result = <span class="k">await</span> <span class="f">generate_learning_notes</span>(session_id, current_user_email)
+        <span class="k">yield</span> <span class="f">_sse</span>({<span class="s">"type"</span>: <span class="s">"done"</span>, <span class="s">"response"</span>: <span class="s">"Your notes are ready in Notion!"</span>,
+                    <span class="s">"status"</span>: result[<span class="s">"status"</span>], <span class="s">"notion_urls"</span>: result[<span class="s">"notion_urls"</span>], <span class="s">"sources"</span>: sources})
+    <span class="k">else</span>:
+        <span class="k">yield</span> <span class="f">_sse</span>({<span class="s">"type"</span>: <span class="s">"done"</span>, <span class="s">"response"</span>: display_reply,
+                    <span class="s">"status"</span>: <span class="s">"chatting"</span>, <span class="s">"notion_urls"</span>: [], <span class="s">"sources"</span>: sources})</pre>
+
+  <!-- ============================================================= -->
+  <h2>5. The tail-buffer (the tricky part)</h2>
+  <p>The intake prompt emits a control token, <code>READY_TO_GENERATE</code>, when it wants
+  to build notes. We must <b>never</b> show it. But if we stream raw tokens, the user would
+  watch it appear letter by letter. The fix: hold back the last few characters so a
+  half-arrived sentinel is never flushed, and strip any completed one.</p>
+
+  <div class="card">
+    <h3>Why hold back <code>len(SENTINEL) - 1</code> = 16 chars?</h3>
+    <p>A complete sentinel is 17 chars. If we always keep the last 16 unflushed, then any
+    sentinel that's still <i>arriving</i> (16 chars or fewer so far) sits safely in the buffer
+    until the next token completes it — at which point <code>re.sub</code> deletes it. Text older
+    than the last 16 chars can't be part of an unfinished sentinel, so it's safe to emit.</p>
+  </div>
+
+  <h3>Worked example — sentinel split across tokens</h3>
+  <pre><span class="c"># tokens arriving:  "Done. "  "READY"  "_TO_"  "GENERATE"  " bye"</span>
+
+pending=<span class="s">"Done. "</span>              cleaned=<span class="s">"Done. "</span>       len 6  &lt;= 16  -> hold all
+pending=<span class="s">"Done. READY"</span>         cleaned unchanged     len 11 &lt;= 16  -> hold all
+pending=<span class="s">"Done. READY_TO_"</span>      cleaned unchanged     len 15 &lt;= 16  -> hold all
+pending=<span class="s">"Done. READY_TO_GENERATE"</span>  re.sub removes it -> <span class="s">"Done. "</span>  len 6 -> hold
+pending=<span class="s">"Done.  bye"</span>          <span class="c"># after " bye" arrives</span>  -> flush <span class="s">"Done.  bye"</span>
+
+<span class="c"># RESULT streamed to user:  "Done.  bye"   (sentinel never appeared)</span>
+<span class="c"># full_raw still holds it -> we detect "ready" and trigger note generation.</span></pre>
+
+  <div class="note">
+    Two variables do two jobs: <code>pending</code> is the <b>cleaned</b> buffer we flush from
+    (sentinel stripped); <code>full_raw</code> is the <b>raw</b> accumulation we scan at the end
+    to decide whether notes generation should fire. Splitting them is what lets us hide the
+    token from the user <i>and</i> still act on it.
+  </div>
+
+  <!-- ============================================================= -->
+  <h2>6. The FastAPI endpoint</h2>
+  <p><code>StreamingResponse</code> takes any async generator and pipes each yielded string
+  to the client with the <code>text/event-stream</code> content type. The wrapper catches
+  mid-stream errors and turns them into a final <code>error</code> event instead of a dropped
+  connection.</p>
+
+  <pre><span class="k">@router.post</span>(<span class="s">"/message/stream"</span>)
+<span class="k">async def</span> <span class="f">message_stream</span>(
+    message: <span class="k">str</span> = <span class="f">Form</span>(...),
+    session_id: <span class="k">str</span> = <span class="f">Header</span>(...),
+    current_user: TokenData = <span class="f">Depends</span>(get_current_user),
+    attachments: <span class="k">list</span>[UploadFile] = <span class="f">File</span>(default=[]),
+):
+    <span class="k">await</span> <span class="f">get_chat</span>(session_id, current_user.email)
+    processed = <span class="k">await</span> <span class="f">process_message_attachments</span>(attachments, current_user.email, session_id)
+
+    <span class="k">async def</span> <span class="f">event_source</span>():
+        <span class="k">try</span>:
+            <span class="k">async for</span> event <span class="k">in</span> <span class="f">get_claude_response_stream</span>(
+                    session_id=session_id, user_message=message,
+                    current_user_email=current_user.email,
+                    attachments=processed <span class="k">or</span> <span class="k">None</span>):
+                <span class="k">yield</span> event
+        <span class="k">except</span> Exception <span class="k">as</span> e:
+            <span class="k">yield</span> <span class="s">f"data: {json.dumps({'type':'error','message':str(e)})}\n\n"</span>
+
+    <span class="k">return</span> <span class="f">StreamingResponse</span>(
+        <span class="f">event_source</span>(),
+        media_type=<span class="s">"text/event-stream"</span>,
+        headers={
+            <span class="s">"Cache-Control"</span>: <span class="s">"no-cache"</span>,
+            <span class="s">"Connection"</span>: <span class="s">"keep-alive"</span>,
+            <span class="s">"X-Accel-Buffering"</span>: <span class="s">"no"</span>,   <span class="c"># stop nginx from buffering the stream</span>
+        },
+    )</pre>
+
+  <div class="warn">
+    <b>Frontend gotcha:</b> the browser's native <code>EventSource</code> API <b>cannot send an
+    <code>Authorization</code> header</b>, and our auth is a Bearer token. So the frontend must
+    consume this with <code>fetch()</code> + <code>response.body.getReader()</code>, not
+    <code>EventSource</code>.
+  </div>
+
+  <!-- ============================================================= -->
+  <h2>7. Shared code (no duplication)</h2>
+  <p>The streaming and non-streaming responders share one pipeline. During this change the
+  common parts were extracted so both call the same functions:</p>
+  <table>
+    <tr><th>Helper</th><th>Job</th><th>Used by</th></tr>
+    <tr><td><code>retrieve_context_and_sources()</code></td><td>hybrid recall → rerank → numbered context + sources</td><td>both</td></tr>
+    <tr><td><code>build_llm_messages()</code></td><td>system prompt (+ guard) + sliding-window history</td><td>both</td></tr>
+    <tr><td><code>mark_cited_sources()</code></td><td>flag which sources got an [n] citation</td><td>both</td></tr>
+    <tr><td><code>strip_sentinel()</code></td><td>remove READY_TO_GENERATE from display text</td><td>both</td></tr>
+    <tr><td><code>_maybe_extract_context()</code></td><td>pull target_tech / known_stack from the convo</td><td>both</td></tr>
+  </table>
+  <p class="small">The blocking <code>get_claude_response</code> keeps working and returns
+  <code>(reply, sources)</code>; the old <code>/message</code> endpoint is untouched. The stream
+  is purely additive.</p>
+
+  <!-- ============================================================= -->
+  <h2>8. Proof — a real run</h2>
+  <p>Live request against the running server (<code>curl -N</code>, a fresh session with no
+  documents, so <code>sources</code> is empty):</p>
+  <pre>data: {<span class="s">"type"</span>: <span class="s">"sources"</span>, <span class="s">"sources"</span>: []}
+
+data: {<span class="s">"type"</span>: <span class="s">"delta"</span>, <span class="s">"text"</span>: <span class="s">"An "</span>}
+data: {<span class="s">"type"</span>: <span class="s">"delta"</span>, <span class="s">"text"</span>: <span class="s">"asy"</span>}
+data: {<span class="s">"type"</span>: <span class="s">"delta"</span>, <span class="s">"text"</span>: <span class="s">"nc"</span>}
+data: {<span class="s">"type"</span>: <span class="s">"delta"</span>, <span class="s">"text"</span>: <span class="s">" event loo"</span>}
+   <span class="c">… ~90 delta frames …</span>
+data: {<span class="s">"type"</span>: <span class="s">"done"</span>, <span class="s">"response"</span>: <span class="s">"An async event loop is…"</span>,
+       <span class="s">"status"</span>: <span class="s">"chatting"</span>, <span class="s">"notion_urls"</span>: [], <span class="s">"sources"</span>: []}</pre>
+  <p class="small">The fragmented deltas (<code>"asy"</code>, <code>"nc"</code>, <code>"event loo"</code>)
+  prove it's true token streaming, not a buffered response chopped up. No sentinel leaked; the
+  <code>done</code> event carried the assembled reply.</p>
+
+  <p class="small" style="margin-top:40px; text-align:center;">LearnMate RAG · SSE streaming walkthrough · open in any browser</p>
+</div>
+</body>
+</html>

@@ -1,11 +1,13 @@
 # app/api/chat.py
 
+import json
 from uuid import uuid4
 from fastapi import APIRouter, Header, Depends, Body, UploadFile, File, Form
+from fastapi.responses import StreamingResponse
 from app.core.session import get_session, clear_session, create_chat, list_chats, get_chat, update_chat_title
 from app.models.schema import ChatResponse, ChatCreateRequest, ChatCreateResponse, ChatListResponse, ChatUpdateTitleRequest, SessionMessagesResponse
 from app.core.session import set_context, get_context
-from app.services.claude_service import get_claude_response
+from app.services.claude_service import get_claude_response, get_claude_response_stream
 from app.api.learn import generate_learning_notes
 from app.services.file_service import process_uploaded_file
 from app.core.security import get_current_user
@@ -13,6 +15,49 @@ from app.models.user import TokenData
 from app.services.rag_service import index_document, save_document_metadata
 
 router = APIRouter()
+
+
+async def process_message_attachments(
+    attachments: list[UploadFile], user_email: str, session_id: str
+) -> list[dict]:
+    # Extract, persist and index each attachment. Documents are chunked+embedded
+    # for retrieval; images are passed through as base64. Shared by /message and
+    # /message/stream.
+    processed = []
+    for file in attachments:
+        result = await process_uploaded_file(file)
+        att_id = str(uuid4())
+
+        if result.get("type") == "document":
+            document = await save_document_metadata(
+                user_email=user_email,
+                filename=result.get("filename"),
+                file_type=result.get("type"),
+            )
+            await index_document(
+                document_id=document.id,
+                user_email=user_email,
+                text=result.get("text", ""),
+                session_id=session_id,
+            )
+            processed.append({
+                "id": att_id,
+                "filename": result.get("filename"),
+                "type": "document",
+                "mime_type": result.get("mime", "application/octet-stream"),
+                "text": result.get("text"),
+            })
+
+        elif result.get("type") == "image":
+            processed.append({
+                "id": att_id,
+                "filename": result.get("filename"),
+                "type": "image",
+                "mime_type": result.get("mime_type"),
+                "base64": result.get("base64"),
+            })
+
+    return processed
 
 
 @router.post("/chats", response_model=ChatCreateResponse)
@@ -53,50 +98,16 @@ async def message(
 ) -> ChatResponse:
     await get_chat(session_id, current_user.email)
 
-    processed_attachments = []
-    
-    for file in attachments:
-        result = await process_uploaded_file(file)
-        
-        att_id = str(uuid4())
-        
-        if result.get("type") == "document":
-            document = await save_document_metadata(
-                user_email=current_user.email,
-                filename=result.get("filename"),
-                file_type=result.get("type")
-            )
-            
-            await index_document(
-                document_id=document.id,
-                user_email=current_user.email,
-                text=result.get("text", ""),
-                session_id=session_id
-            )
-            
-            processed_attachments.append({
-                "id": att_id,
-                "filename": result.get("filename"),
-                "type": "document",
-                "mime_type": result.get("mime", "application/octet-stream"),
-                "text": result.get("text"),
-            })
-        
-        elif result.get("type") == "image":
-            processed_attachments.append({
-                "id": att_id,
-                "filename": result.get("filename"),
-                "type": "image",
-                "mime_type": result.get("mime_type"),
-                "base64": result.get("base64"),
-            })
-    
+    processed_attachments = await process_message_attachments(
+        attachments, current_user.email, session_id
+    )
+
     # We deliberately do NOT staple the extracted file text onto the user
     # message. The document is already indexed for retrieval above, so the
     # model receives its content through RAG (see get_claude_response). Inlining
     # the raw text here would also leak the entire file dump into the visible
     # user bubble when the frontend reloads chat history.
-    claude_response = await get_claude_response(
+    claude_response, sources = await get_claude_response(
         session_id=session_id,
         user_message=message,
         current_user_email=current_user.email,
@@ -110,9 +121,50 @@ async def message(
             session_id=session_id,
             status=result["status"],
             notion_urls=result["notion_urls"],
+            notion_pages=result.get("notion_pages", []),
         )
 
-    return ChatResponse(response=claude_response, session_id=session_id)
+    return ChatResponse(response=claude_response, session_id=session_id, sources=sources)
+
+
+@router.post("/message/stream")
+async def message_stream(
+    message: str = Form(...),
+    session_id: str = Header(...),
+    current_user: TokenData = Depends(get_current_user),
+    attachments: list[UploadFile] = File(default=[]),
+):
+    # Server-Sent Events version of /message: streams the answer token-by-token.
+    # Same contract (multipart form: `message` + optional `attachments`, plus the
+    # `session-id` header). Response is text/event-stream instead of JSON.
+    await get_chat(session_id, current_user.email)
+
+    processed_attachments = await process_message_attachments(
+        attachments, current_user.email, session_id
+    )
+
+    async def event_source():
+        try:
+            async for event in get_claude_response_stream(
+                session_id=session_id,
+                user_message=message,
+                current_user_email=current_user.email,
+                attachments=processed_attachments if processed_attachments else None,
+            ):
+                yield event
+        except Exception as e:
+            # Surface failures as a final SSE event instead of a dropped stream.
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+    return StreamingResponse(
+        event_source(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # disable proxy (nginx) response buffering
+        },
+    )
 
 
 @router.post("/upload")
