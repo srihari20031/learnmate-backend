@@ -2,7 +2,7 @@
 
 import json
 from uuid import uuid4
-from fastapi import APIRouter, Header, Depends, Body, UploadFile, File, Form
+from fastapi import APIRouter, Header, Depends, Body, UploadFile, File, Form, BackgroundTasks, status
 from fastapi.responses import StreamingResponse
 from app.core.session import get_session, clear_session, create_chat, list_chats, get_chat, update_chat_title
 from app.models.schema import ChatResponse, ChatCreateRequest, ChatCreateResponse, ChatListResponse, ChatUpdateTitleRequest, SessionMessagesResponse
@@ -167,25 +167,50 @@ async def message_stream(
     )
 
 
-@router.post("/upload")
-async def upload_file(session_id: str = Header(...), file: UploadFile = File(...), current_user: TokenData = Depends(get_current_user)):
+@router.post("/upload", status_code=status.HTTP_202_ACCEPTED)
+async def upload_file(
+    background_tasks: BackgroundTasks,
+    session_id: str = Header(...),
+    file: UploadFile = File(...),
+    current_user: TokenData = Depends(get_current_user),
+):
     await get_chat(session_id, current_user.email)
+
+    # Read/extract the file NOW — the UploadFile is tied to this request and may
+    # be gone by the time the background task runs.
     result = await process_uploaded_file(file)
+
     if result.get("type") == "document":
         document = await save_document_metadata(
             user_email=current_user.email,
             filename=result.get("filename"),
-            file_type=result.get("type")
+            file_type=result.get("type"),
         )
-        
-        await index_document(
-            document_id=document.id,
-            user_email=current_user.email,
-            text=result.get("text", ""),
-            session_id=session_id
+
+        # Defer the heavy indexing (chunk + embed + store) to after the response,
+        # so the user gets an instant reply. The frontend polls
+        # GET /api/documents/{id}/status until status flips to "ready"/"failed".
+        background_tasks.add_task(
+            index_document,
+            document.id,
+            current_user.email,
+            result.get("text", ""),
+            session_id,
         )
-        
-    return {"filename": result.get("filename"), "type": result.get("type"), "status": "uploaded"}
+
+        return {
+            "document_id": document.id,
+            "filename": result.get("filename"),
+            "type": "document",
+            "status": "processing",
+        }
+
+    # Images need no indexing — already done.
+    return {
+        "filename": result.get("filename"),
+        "type": result.get("type"),
+        "status": "uploaded",
+    }
 
 
 @router.get("/session/{session_id}", response_model=SessionMessagesResponse)

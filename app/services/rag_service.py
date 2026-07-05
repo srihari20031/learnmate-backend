@@ -1,6 +1,7 @@
 # app/services/rag_service.py
 
 import asyncio
+import logging
 from datetime import datetime
 from types import SimpleNamespace
 from bson import ObjectId
@@ -23,6 +24,8 @@ from app.services.embedding import (
     )
 from app.services.keyword_service import invalidate_bm25
 from app.models.schema import DocumentStatus
+
+logger = logging.getLogger(__name__)
 
 
 async def save_document_metadata(
@@ -229,4 +232,10 @@ async def index_document(
             },
         )
 
-        raise
+        # Record the failure in the doc's status and log it, but DON'T re-raise.
+        # When called as a BackgroundTask the response is already sent, so a
+        # raise would only surface as an unhandled task error; the client learns
+        # of failure by polling status. (Also lets the /message path degrade
+        # gracefully — answer without the doc rather than 500.)
+        logger.exception("Indexing failed for document %s", document_id)
+        return {"status": "failed", "document_id": document_id}

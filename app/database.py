@@ -10,6 +10,7 @@ generated_notes_collection = db["generated_notes"]
 contexts_collection = db["session_contexts"]
 documents_collection = db["documents"]
 documents_metadata_collection = db["documents_metadata"]
+profiles_collection = db["user_profiles"]
 
 async def close_db():
     client.close()

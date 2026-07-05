@@ -6,6 +6,7 @@ from groq import AsyncGroq
 from app.core.config import settings
 from app.core.session import get_session, add_message, set_context, get_context
 from app.prompts.intake import SYSTEM_PROMPT
+from app.services.profile_service import resolve_known_stack, merge_stacks
 import json
 
 client = AsyncGroq(api_key=settings.groq_api_key)
@@ -64,7 +65,13 @@ If not found return null for that field.
         if data.get("target_tech"):
             await set_context(session_id, "target_tech", data["target_tech"], current_user_email)
         if data.get("known_stack"):
-            await set_context(session_id, "known_stack", data["known_stack"], current_user_email)
+            # Merge, don't overwrite: the resume-derived profile stack and prior
+            # conversation may already have seeded known_stack. We want the union,
+            # not whichever ran last. (Session context holds the per-chat delta;
+            # the user-wide base lives in the profile.)
+            existing = await get_context(session_id, current_user_email)
+            merged = merge_stacks(existing.get("known_stack"), data["known_stack"])
+            await set_context(session_id, "known_stack", merged, current_user_email)
     except Exception as e:
         print("Context extraction failed:", e)
 
@@ -215,10 +222,33 @@ async def retrieve_context_and_sources(
     return document_context, sources
 
 
-def build_llm_messages(history: list, document_context: str) -> list:
-    # System prompt (+ grounding/injection guard when we have context) followed
-    # by the sliding-window chat history.
+def build_known_stack_preamble(known_stack: str) -> str:
+    # A resume gives us the user's background up front, but it may be incomplete —
+    # they might know more than what's written there. So we seed the known stack
+    # AND explicitly keep the door open for additions, instead of treating the
+    # resume as the final word (which would make the agent ignore extra skills).
+    return (
+        "\n\n## Known User Background (from their uploaded resume/profile)\n"
+        f"The user has ALREADY shared, via an uploaded resume, that they have "
+        f"experience with: {known_stack}.\n"
+        "Treat this as their starting known_stack — do NOT make them restate it, "
+        "and do NOT ask the generic 'what do you already know?' question as if you "
+        "have nothing. Instead, acknowledge this background naturally, then ask "
+        "only whether there's anything ELSE relevant to the target technology that "
+        "isn't captured in their resume. If they add more, merge it into the known "
+        "stack; if they say that's everything, proceed."
+    )
+
+
+def build_llm_messages(
+    history: list, document_context: str, known_stack: str | None = None
+) -> list:
+    # System prompt, optionally augmented with (a) the user's known stack derived
+    # from an uploaded resume and (b) the grounding/injection guard when we have
+    # retrieved document context — followed by the sliding-window chat history.
     system_prompt = SYSTEM_PROMPT
+    if known_stack:
+        system_prompt += build_known_stack_preamble(known_stack)
     if document_context:
         system_prompt += build_context_guard(document_context)
     return [{"role": "system", "content": system_prompt}] + apply_sliding_window(
@@ -248,7 +278,8 @@ async def get_claude_response(
 
     await add_message(session_id, "user", user_message, current_user_email, attachments=attachments)
     history = await get_session(session_id, current_user_email)
-    messages = build_llm_messages(history, document_context)
+    known_stack = await resolve_known_stack(session_id, current_user_email)
+    messages = build_llm_messages(history, document_context, known_stack)
 
     response = await client.chat.completions.create(model=MODEL, messages=messages)
     reply = response.choices[0].message.content
@@ -288,7 +319,8 @@ async def get_claude_response_stream(
 
     await add_message(session_id, "user", user_message, current_user_email, attachments=attachments)
     history = await get_session(session_id, current_user_email)
-    messages = build_llm_messages(history, document_context)
+    known_stack = await resolve_known_stack(session_id, current_user_email)
+    messages = build_llm_messages(history, document_context, known_stack)
 
     stream = await client.chat.completions.create(model=MODEL, messages=messages, stream=True)
 

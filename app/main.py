@@ -4,6 +4,8 @@ from app.api.notion import router as notion_router
 from app.api.notion_auth import router as notion_auth_router
 from app.api.learn import router as learn_router
 from app.api.auth import router as auth_router
+from app.api.documents import router as documents_router
+from app.api.profile import router as profile_router
 from app.core.qdrant import ensure_collection
 from app.database import close_db
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,6 +25,8 @@ app.include_router(chat_router, prefix="/api/chat")
 app.include_router(notion_router, prefix="/api/notion")
 app.include_router(notion_auth_router, prefix="/api/notion", tags=["notion-auth"])
 app.include_router(learn_router, prefix="/api/learn")
+app.include_router(documents_router, prefix="/api/documents", tags=["documents"])
+app.include_router(profile_router, prefix="/api/profile", tags=["profile"])
 
 @app.get("/health")
 async def health():
