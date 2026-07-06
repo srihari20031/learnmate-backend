@@ -8,7 +8,7 @@ from app.core.session import get_session, clear_session, create_chat, list_chats
 from app.models.schema import ChatResponse, ChatCreateRequest, ChatCreateResponse, ChatListResponse, ChatUpdateTitleRequest, SessionMessagesResponse
 from app.core.session import set_context, get_context
 from app.services.claude_service import get_claude_response, get_claude_response_stream
-from app.api.learn import generate_learning_notes
+from app.services.tutor_service import handle_turn
 from app.services.file_service import process_uploaded_file
 from app.core.security import get_current_user
 from app.models.user import TokenData
@@ -103,28 +103,26 @@ async def message(
     )
 
     # We deliberately do NOT staple the extracted file text onto the user
-    # message. The document is already indexed for retrieval above, so the
-    # model receives its content through RAG (see get_claude_response). Inlining
-    # the raw text here would also leak the entire file dump into the visible
-    # user bubble when the frontend reloads chat history.
-    claude_response, sources = await get_claude_response(
+    # message. The document is already indexed for retrieval, so the model
+    # receives its content through RAG. The turn orchestrator handles both
+    # conversational replies and the guided topic-by-topic teaching flow,
+    # including the READY_TO_GENERATE / START_TEACHING / NEXT_TOPIC control
+    # tokens and any Notion note generation.
+    result = await handle_turn(
         session_id=session_id,
         user_message=message,
-        current_user_email=current_user.email,
+        user_email=current_user.email,
         attachments=processed_attachments if processed_attachments else None,
     )
 
-    if "READY_TO_GENERATE" in claude_response.upper():
-        result = await generate_learning_notes(session_id, current_user.email)
-        return ChatResponse(
-            response="Your notes are ready in Notion!",
-            session_id=session_id,
-            status=result["status"],
-            notion_urls=result["notion_urls"],
-            notion_pages=result.get("notion_pages", []),
-        )
-
-    return ChatResponse(response=claude_response, session_id=session_id, sources=sources)
+    return ChatResponse(
+        response=result["reply"],
+        session_id=session_id,
+        status=result["status"],
+        sources=result.get("sources", []),
+        notion_pages=result.get("notion_pages", []),
+        notion_urls=[p["url"] for p in result.get("notion_pages", [])],
+    )
 
 
 @router.post("/message/stream")

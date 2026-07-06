@@ -365,16 +365,29 @@ async def get_claude_response_stream(
         yield _sse({"type": "status", "status": "generating_notes"})
         from app.api.learn import generate_learning_notes  # deferred: avoids circular import
         result = await generate_learning_notes(session_id, current_user_email)
-        yield _sse(
-            {
-                "type": "done",
-                "response": "Your notes are ready in Notion!",
-                "status": result["status"],
-                "notion_urls": result["notion_urls"],
-                "notion_pages": result.get("notion_pages", []),
-                "sources": sources,
-            }
-        )
+        if result.get("notion_urls"):
+            yield _sse(
+                {
+                    "type": "done",
+                    "response": "Your notes are ready in Notion!",
+                    "status": result["status"],
+                    "notion_urls": result["notion_urls"],
+                    "notion_pages": result.get("notion_pages", []),
+                    "sources": sources,
+                }
+            )
+        else:
+            # Sentinel fired without an established topic -> no notes made. Ask
+            # rather than claim success.
+            yield _sse(
+                {
+                    "type": "done",
+                    "response": "I'd be happy to create notes! Which technology should I build them around?",
+                    "status": "chatting",
+                    "notion_urls": [],
+                    "sources": sources,
+                }
+            )
     else:
         yield _sse(
             {
@@ -388,11 +401,12 @@ async def get_claude_response_stream(
 
 
 async def generate_curriculum_ai(known_stack: str, target_tech: str) -> list[str]:
-    prompt = f"""Generate a list of 6-8 important topics to learn for {target_tech} 
-for a developer who already knows {known_stack}.
+    prompt = f"""You are designing a learning path for a developer who wants to learn {target_tech} and already knows {known_stack}.
 
-Return ONLY a JSON array of topic strings, nothing else.
-Example: ["Routing", "Middleware", "Authentication"]
+List 6-8 key topics, ordered as a proper LEARNING PATH: start with the core fundamentals and mental model a newcomer to {target_tech} must grasp FIRST, then build up so each topic logically depends on the ones before it, ending with the more advanced topics. Do not put an advanced/orchestration topic first. Focus on core concepts (skip trivial install/setup steps).
+
+Return ONLY a JSON array of topic strings in learning order, nothing else.
+Example (for Docker): ["Images and Containers", "Writing a Dockerfile", "Volumes and Data Persistence", "Networking", "Docker Compose"]
 """
     response = await client.chat.completions.create(
         model=MODEL,

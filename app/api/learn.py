@@ -2,7 +2,7 @@ from fastapi import APIRouter, Header, Depends
 
 from app.models.schema import ChatRequest, LearnResponse
 from app.services.claude_service import get_claude_response, generate_curriculum_ai
-from app.services.note_generator import generate_note
+from app.services.note_generator import generate_note, generate_personalized_note
 from app.services.notion_service import create_notion_topic, create_user_parent_page
 from app.core.session import get_context, get_chat, update_last_message
 from app.core.security import get_current_user
@@ -19,25 +19,17 @@ from app.services.cache_service import (
 router = APIRouter()
 
 
-async def generate_learning_notes(session_id: str, user_email: str) -> dict:
-    await get_chat(session_id, user_email)
-
-    context = await get_context(session_id, user_email)
-    known_stack = context.get("known_stack") or "beginner"
-    target_tech = context.get("target_tech")
-
-    if not target_tech:
-        return {
-            "status": "chatting",
-            "notion_urls": [],
-            "notion_pages": [],
-        }
-
+async def resolve_notion_target(
+    user_email: str, target_tech: str | None = None, known_stack: str | None = None
+) -> tuple[str, str | None]:
+    # Work out where a user's notes should be created: their own connected Notion
+    # workspace (creating a parent page on first use) or the app's fallback
+    # workspace. Shared by batch note generation and the topic-by-topic tutor.
     user_doc = await users_collection.find_one({"email": user_email})
     notion_token = user_doc.get("notion_access_token") if user_doc else None
     notion_parent_page_id = user_doc.get("notion_parent_page_id") if user_doc else None
 
-    if notion_token and not notion_parent_page_id and known_stack and target_tech:
+    if notion_token and not notion_parent_page_id and target_tech:
         try:
             notion_parent_page_id = create_user_parent_page(
                 access_token=notion_token,
@@ -54,6 +46,63 @@ async def generate_learning_notes(session_id: str, user_email: str) -> dict:
     if not notion_token:
         notion_token = settings.notion_api_key
         notion_parent_page_id = settings.notion_parent_page_id
+
+    return notion_token, notion_parent_page_id
+
+
+async def save_single_note(
+    session_id: str,
+    user_email: str,
+    topic: str,
+    known_stack: str,
+    target_tech: str,
+    doubts: list[str] | None = None,
+) -> dict:
+    # Generate ONE topic's note and save it to Notion, returning {title, url}.
+    # When `doubts` is provided (the guided tutor path), the note is personalized
+    # to the learner's questions and NOT cache-served; otherwise it uses the
+    # shared curriculum-note cache.
+    notion_token, parent_page_id = await resolve_notion_target(
+        user_email, target_tech, known_stack
+    )
+
+    if doubts:
+        note_content = await generate_personalized_note(
+            topic, known_stack, target_tech, doubts
+        )
+    else:
+        note_content = await get_cached_note(topic, known_stack, target_tech)
+        if not note_content:
+            note_content = await generate_note(topic, known_stack, target_tech)
+            await set_cached_note(topic, known_stack, target_tech, note_content)
+
+    url = await create_notion_topic(
+        title=topic,
+        content=note_content,
+        session_id=session_id,
+        notion_token=notion_token,
+        page_id=parent_page_id,
+    )
+    return {"title": topic, "url": url}
+
+
+async def generate_learning_notes(session_id: str, user_email: str) -> dict:
+    await get_chat(session_id, user_email)
+
+    context = await get_context(session_id, user_email)
+    known_stack = context.get("known_stack") or "beginner"
+    target_tech = context.get("target_tech")
+
+    if not target_tech:
+        return {
+            "status": "chatting",
+            "notion_urls": [],
+            "notion_pages": [],
+        }
+
+    notion_token, notion_parent_page_id = await resolve_notion_target(
+        user_email, target_tech, known_stack
+    )
 
     topics = await get_cached_curriculum(known_stack, target_tech)
     if not topics:
@@ -111,6 +160,16 @@ async def learn(
         )
 
     result = await generate_learning_notes(session_id, current_user.email)
+
+    if not result.get("notion_urls"):
+        # Sentinel fired before a topic was established -> nothing generated.
+        return LearnResponse(
+            response="I'd be happy to create notes! Which technology should I build them around?",
+            session_id=session_id,
+            status="chatting",
+            notion_urls=[],
+            sources=sources,
+        )
 
     return LearnResponse(
         response="Your notes are ready in Notion!",
