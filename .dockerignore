@@ -3,3 +3,7 @@
 venv
 __pycache__
 .pytest_cache
+
+# Generated code graph: the runtime never reads it, and regenerating it would
+# invalidate the `COPY . .` layer and force a rebuild of everything below it.
+graphify-out

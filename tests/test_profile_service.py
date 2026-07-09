@@ -59,5 +59,14 @@ def test_preamble_includes_the_stack():
 def test_preamble_tells_model_not_to_re_ask():
     p = build_known_stack_preamble("Python").lower()
     assert "do not make them restate" in p
-    # stays open to additions beyond the resume (the user's requirement).
-    assert "else" in p and "resume" in p
+    # Stays open to skills the profile doesn't capture (the user's requirement).
+    assert "else" in p
+
+
+def test_preamble_never_calls_the_profile_an_uploaded_document():
+    # The preamble used to say the stack came "via an uploaded resume", which led the
+    # model to recite the profile when asked "what does my uploaded document say?" in a
+    # chat with no documents. It must now disclaim that explicitly and never say "resume".
+    p = build_known_stack_preamble("Python").lower()
+    assert "not a document they uploaded" in p
+    assert "resume" not in p
