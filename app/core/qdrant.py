@@ -24,7 +24,9 @@ async def ensure_collection():
             vectors_config=VectorParams(size=384, distance=Distance.COSINE),
         )
 
-    for field_name in ("user_email", "session_id"):
+    # document_id is indexed too so a SINGLE document's vectors can be deleted by
+    # payload filter (Qdrant rejects a filter on an unindexed keyword field).
+    for field_name in ("user_email", "session_id", "document_id"):
         try:
             await async_qdrant_client.create_payload_index(
                 collection_name=COLLECTION_NAME,

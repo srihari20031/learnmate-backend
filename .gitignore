@@ -53,3 +53,5 @@ alembic/versions/*.pyc
 
 # MyPy
 .mypy_cache/
+# graphify code graph (generated)
+graphify-out/

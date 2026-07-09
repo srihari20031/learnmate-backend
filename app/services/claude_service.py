@@ -228,15 +228,19 @@ def build_known_stack_preamble(known_stack: str) -> str:
     # AND explicitly keep the door open for additions, instead of treating the
     # resume as the final word (which would make the agent ignore extra skills).
     return (
-        "\n\n## Known User Background (from their uploaded resume/profile)\n"
-        f"The user has ALREADY shared, via an uploaded resume, that they have "
-        f"experience with: {known_stack}.\n"
-        "Treat this as their starting known_stack — do NOT make them restate it, "
-        "and do NOT ask the generic 'what do you already know?' question as if you "
-        "have nothing. Instead, acknowledge this background naturally, then ask "
-        "only whether there's anything ELSE relevant to the target technology that "
-        "isn't captured in their resume. If they add more, merge it into the known "
-        "stack; if they say that's everything, proceed."
+        "\n\n## The user's known background\n"
+        f"We already know the user's existing tech background: {known_stack}.\n"
+        "IMPORTANT: this is profile/background information about the user — it is "
+        "NOT a document they uploaded into this chat. Never describe it as their "
+        "'document', 'uploaded document', or 'file'. If the user asks what their "
+        "uploaded document/file says and no document context is provided in this "
+        "message, tell them there are no documents in this chat yet (do NOT recite "
+        "this background as if it were a document).\n"
+        "Use this background to tailor explanations. Do NOT make them restate it, "
+        "and do NOT ask the generic 'what do you already know?' question. "
+        "Acknowledge it naturally, then ask only whether there's anything ELSE "
+        "relevant that isn't captured here. If they add more, treat it as part of "
+        "their known stack."
     )
 
 
@@ -302,102 +306,60 @@ def _sse(payload: dict) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
 
+def _chunk_for_stream(text: str, words_per_chunk: int = 6):
+    # Split a finished reply into small word-groups so the SSE endpoint can still
+    # render progressively. Concatenating all yielded chunks reproduces the text
+    # exactly (the inter-group space that split() consumed is re-added).
+    if not text:
+        return
+    words = text.split(" ")
+    for i in range(0, len(words), words_per_chunk):
+        chunk = " ".join(words[i:i + words_per_chunk])
+        if i + words_per_chunk < len(words):
+            chunk += " "
+        yield chunk
+
+
 async def get_claude_response_stream(
     session_id: str,
     user_message: str,
     current_user_email: str,
     attachments: list[dict] | None = None,
 ):
-    # Async generator of SSE strings — same pipeline as get_claude_response, but
-    # the LLM output streams token-by-token.
-    document_context, sources = await retrieve_context_and_sources(
-        session_id, current_user_email, user_message
-    )
+    # SSE wrapper around the single turn orchestrator (handle_turn), so the
+    # streaming path behaves EXACTLY like the blocking one: conversational
+    # replies, the guided topic-by-topic teaching flow, and all control-token
+    # interception (START_TEACHING / NEXT_TOPIC / READY_TO_GENERATE). The old
+    # token-by-token implementation only knew about READY_TO_GENERATE, so
+    # START_TEACHING and NEXT_TOPIC leaked into the UI as raw text.
+    #
+    # Teaching turns run several internal LLM calls, so true end-to-end token
+    # streaming isn't possible here; we run the turn, then re-chunk the final
+    # reply into the same delta events the frontend already consumes.
+    from app.services.tutor_service import handle_turn
 
-    # Sources are known before generation, so send them up front.
+    result = await handle_turn(
+        session_id, user_message, current_user_email, attachments
+    )
+    sources = result.get("sources", [])
+    reply = result.get("reply", "") or ""
+    notion_pages = result.get("notion_pages", [])
+
     yield _sse({"type": "sources", "sources": sources})
 
-    await add_message(session_id, "user", user_message, current_user_email, attachments=attachments)
-    history = await get_session(session_id, current_user_email)
-    known_stack = await resolve_known_stack(session_id, current_user_email)
-    messages = build_llm_messages(history, document_context, known_stack)
+    for piece in _chunk_for_stream(reply):
+        yield _sse({"type": "delta", "text": piece})
 
-    stream = await client.chat.completions.create(model=MODEL, messages=messages, stream=True)
-
-    # Tail-buffer so the sentinel never leaks: hold back the last
-    # (len(SENTINEL)-1) chars — anything shorter can't yet be a full sentinel —
-    # and strip any completed sentinel before flushing.
-    hold = len(SENTINEL) - 1
-    full_raw = ""
-    pending = ""
-
-    async for chunk in stream:
-        delta = chunk.choices[0].delta.content or ""
-        if not delta:
-            continue
-        full_raw += delta
-        pending += delta
-
-        cleaned = re.sub(SENTINEL, "", pending, flags=re.IGNORECASE)
-        if len(cleaned) > hold:
-            emit, pending = cleaned[:-hold], cleaned[-hold:]
-            if emit:
-                yield _sse({"type": "delta", "text": emit})
-        else:
-            pending = cleaned
-
-    # Flush the held tail (with any trailing sentinel removed).
-    tail = re.sub(SENTINEL, "", pending, flags=re.IGNORECASE)
-    if tail:
-        yield _sse({"type": "delta", "text": tail})
-
-    # ---- post-processing (mirrors the blocking path) ----
-    reply = full_raw
-    mark_cited_sources(reply, sources)
-    display_reply = strip_sentinel(reply)
-    await add_message(
-        session_id, "assistant", display_reply, current_user_email, sources=sources
+    yield _sse(
+        {
+            "type": "done",
+            "response": reply,
+            "status": result.get("status", "chatting"),
+            "notion_urls": [p["url"] for p in notion_pages],
+            "notion_pages": notion_pages,
+            "sources": sources,
+        }
     )
-    await _maybe_extract_context(session_id, history, current_user_email)
-
-    if SENTINEL.upper() in reply.upper():
-        # Model signalled it's ready -> run note generation as a final phase.
-        yield _sse({"type": "status", "status": "generating_notes"})
-        from app.api.learn import generate_learning_notes  # deferred: avoids circular import
-        result = await generate_learning_notes(session_id, current_user_email)
-        if result.get("notion_urls"):
-            yield _sse(
-                {
-                    "type": "done",
-                    "response": "Your notes are ready in Notion!",
-                    "status": result["status"],
-                    "notion_urls": result["notion_urls"],
-                    "notion_pages": result.get("notion_pages", []),
-                    "sources": sources,
-                }
-            )
-        else:
-            # Sentinel fired without an established topic -> no notes made. Ask
-            # rather than claim success.
-            yield _sse(
-                {
-                    "type": "done",
-                    "response": "I'd be happy to create notes! Which technology should I build them around?",
-                    "status": "chatting",
-                    "notion_urls": [],
-                    "sources": sources,
-                }
-            )
-    else:
-        yield _sse(
-            {
-                "type": "done",
-                "response": display_reply,
-                "status": "chatting",
-                "notion_urls": [],
-                "sources": sources,
-            }
-        )
 
 
 async def generate_curriculum_ai(known_stack: str, target_tech: str) -> list[str]:

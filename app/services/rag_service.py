@@ -113,6 +113,61 @@ async def delete_session_documents(user_email: str, session_id: str | None) -> d
     return {"documents": len(document_ids), "chunks": chunk_result.deleted_count}
 
 
+async def delete_document(document_id: str, user_email: str) -> dict:
+    # Remove ONE uploaded document everywhere it lives: chunk rows and metadata in
+    # Mongo, vectors in Qdrant. Without this there is no way to un-index a single
+    # file — "removing" it in the UI would only hide the row while its chunks stay
+    # indexed and keep surfacing as RAG sources for unrelated questions.
+    # Scoped to the caller's own documents.
+    try:
+        oid = ObjectId(document_id)
+    except Exception:
+        return {"deleted": False, "reason": "invalid_id"}
+
+    meta = await documents_metadata_collection.find_one(
+        {"_id": oid, "user_email": user_email}
+    )
+    if not meta:
+        return {"deleted": False, "reason": "not_found"}
+
+    # Capture the session before deleting the chunks, so we can drop its BM25 index.
+    chunk = await documents_collection.find_one(
+        {"document_id": document_id, "user_email": user_email},
+        projection={"session_id": 1},
+    )
+    session_id = chunk.get("session_id") if chunk else None
+
+    await async_qdrant_client.delete(
+        collection_name=COLLECTION_NAME,
+        points_selector=FilterSelector(
+            filter=Filter(
+                must=[
+                    FieldCondition(key="user_email", match=MatchValue(value=user_email)),
+                    FieldCondition(key="document_id", match=MatchValue(value=document_id)),
+                ]
+            )
+        ),
+    )
+
+    chunk_result = await documents_collection.delete_many(
+        {"document_id": document_id, "user_email": user_email}
+    )
+    await documents_metadata_collection.delete_one(
+        {"_id": oid, "user_email": user_email}
+    )
+
+    # The session's cached BM25 index still holds the deleted chunks.
+    if session_id:
+        invalidate_bm25(session_id)
+
+    return {
+        "deleted": True,
+        "document_id": document_id,
+        "filename": meta.get("filename"),
+        "chunks": chunk_result.deleted_count,
+    }
+
+
 async def get_session_chunks(user_email: str, session_id: str | None) -> list[dict]:
     # All chunks for a session, as {chunk_id, text}. Hybrid search needs the full
     # corpus (not just vector hits) so BM25 can surface chunks vector search

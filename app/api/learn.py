@@ -148,33 +148,18 @@ async def learn(
     session_id: str = Header(...),
     current_user: TokenData = Depends(get_current_user)
 ):
-    response, sources = await get_claude_response(session_id, request.message, current_user.email)
+    # Route through the single turn orchestrator so this endpoint has the same
+    # behavior as /api/chat/message — including guided teaching and control-token
+    # interception (otherwise START_TEACHING / NEXT_TOPIC leak as raw text).
+    from app.services.tutor_service import handle_turn
 
-    if "READY_TO_GENERATE" not in response.upper():
-        return LearnResponse(
-            response=response,
-            session_id=session_id,
-            status="chatting",
-            notion_urls=[],
-            sources=sources,
-        )
-
-    result = await generate_learning_notes(session_id, current_user.email)
-
-    if not result.get("notion_urls"):
-        # Sentinel fired before a topic was established -> nothing generated.
-        return LearnResponse(
-            response="I'd be happy to create notes! Which technology should I build them around?",
-            session_id=session_id,
-            status="chatting",
-            notion_urls=[],
-            sources=sources,
-        )
-
+    result = await handle_turn(session_id, request.message, current_user.email)
+    notion_pages = result.get("notion_pages", [])
     return LearnResponse(
-        response="Your notes are ready in Notion!",
+        response=result["reply"],
         session_id=session_id,
         status=result["status"],
-        notion_urls=result["notion_urls"],
-        notion_pages=result.get("notion_pages", []),
+        notion_urls=[p["url"] for p in notion_pages],
+        notion_pages=notion_pages,
+        sources=result.get("sources", []),
     )

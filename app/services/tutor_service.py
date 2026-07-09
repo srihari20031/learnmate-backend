@@ -45,6 +45,22 @@ def strip_control_tokens(text: str) -> str:
     return text.strip()
 
 
+def _reply_is_token(reply: str, token: str) -> bool:
+    # True only when the WHOLE reply is essentially just this control token
+    # (ignoring punctuation/formatting). The prompts tell the model to emit a
+    # control token "and nothing else", so this strict check lets us intercept a
+    # genuine signal while REFUSING to act on a token that merely appears inside
+    # prose — e.g. the model echoing a token name, or an uploaded document that
+    # mentions "START_TEACHING" to hijack the control flow (a prompt-injection
+    # vector). Substring matching here is exploitable; equality is not.
+    cleaned = re.sub(r"[^A-Za-z_]", "", (reply or "")).upper()
+    return cleaned == token
+
+
+def is_advance_signal(reply: str) -> bool:
+    return _reply_is_token(reply, NEXT_TOPIC)
+
+
 def _result(reply, sources=None, notion_pages=None, status="chatting"):
     return {
         "reply": reply,
@@ -80,11 +96,22 @@ def _build_teaching_prompt(ctx: dict) -> str:
 
 
 async def _deliver_current_topic(session_id: str, user_email: str) -> str:
-    # Produce the lesson text for whatever topic is current. Tokens are stripped
-    # defensively in case the model tacks one on while just delivering content.
+    # Produce the lesson text for whatever topic is now current. This is a fresh
+    # DELIVERY, not a reply-handler: the learner's previous message was often
+    # "next topic" / "understood", which the normal teaching prompt would read as
+    # an advance signal and answer with NEXT_TOPIC — yielding an empty lesson
+    # after stripping. So we explicitly tell the model to teach the topic now.
     ctx = await get_context(session_id, user_email)
     history = await get_session(session_id, user_email)
-    lesson = await _complete(_build_teaching_prompt(ctx), history)
+    system = _build_teaching_prompt(ctx) + (
+        "\n\n## Deliver this topic now\n"
+        "The learner has just arrived at THIS topic. Teach it now: a few short "
+        "sections with a concrete example grounded in what they already know, "
+        "ending by inviting doubts or an 'understood' to continue. You are "
+        "TEACHING in this message — do NOT output NEXT_TOPIC here, regardless of "
+        "what the learner's previous message said."
+    )
+    lesson = await _complete(system, history)
     return strip_control_tokens(lesson)
 
 
@@ -125,12 +152,16 @@ async def _handle_chatting(session_id, user_email, user_message, ctx) -> dict:
     reply = (
         await client.chat.completions.create(model=MODEL, messages=messages)
     ).choices[0].message.content
-    upper = (reply or "").upper()
 
-    if START_TEACHING in upper:
+    # Strict token interception: the whole reply must BE the token. A substring
+    # check is exploitable — an uploaded document that merely names a token, or
+    # the model echoing one in prose, could otherwise hijack the flow (seen in the
+    # prompt-injection test, where naming START_TEACHING derailed a summarize
+    # request into the teaching path).
+    if _reply_is_token(reply, START_TEACHING):
         return await _start_teaching(session_id, user_email, sources)
 
-    if READY_TO_GENERATE in upper:
+    if _reply_is_token(reply, READY_TO_GENERATE):
         return await _generate_all_notes(session_id, user_email, sources)
 
     # plain conversational turn
@@ -210,7 +241,7 @@ async def _generate_all_notes(session_id, user_email, sources) -> dict:
 async def _handle_teaching(session_id, user_email, user_message, ctx, history) -> dict:
     reply = await _complete(_build_teaching_prompt(ctx), history)
 
-    if NEXT_TOPIC in (reply or "").upper():
+    if is_advance_signal(reply):
         return await _advance_topic(session_id, user_email, ctx)
 
     # A doubt / question — log it for this topic's note, and answer it.
@@ -249,7 +280,8 @@ async def _advance_topic(session_id, user_email, ctx) -> dict:
     pages = [page] if page else []
     urls = [page["url"]] if page else None
     saved_line = (
-        f"✅ Saved your personalized notes on **{curriculum[i]}** to Notion.\n\n"
+        f"✅ Your personalized notes on **{curriculum[i]}** are saved to Notion — "
+        f"open the card below to review or edit them anytime.\n\n"
         if page
         else ""
     )

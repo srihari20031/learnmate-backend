@@ -37,3 +37,20 @@ async def get_document_status(
         chunk_count=doc.get("chunk_count", 0),
         uploaded_at=doc.get("uploaded_at"),
     )
+
+
+@router.delete("/{document_id}")
+async def remove_document(
+    document_id: str,
+    current_user: TokenData = Depends(get_current_user),
+):
+    # Un-index a single uploaded document: drops its chunks (Mongo), vectors
+    # (Qdrant) and metadata, so it stops appearing as a RAG source. Called by the
+    # frontend's "X" on a chat document. Scoped to the caller's own documents.
+    from app.services.rag_service import delete_document
+
+    result = await delete_document(document_id, current_user.email)
+    if not result.get("deleted"):
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    return {"status": "ok", **result}
