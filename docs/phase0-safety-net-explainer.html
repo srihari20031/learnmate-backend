@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Phase 0 — The Safety Net — LearnMate</title>
+<style>
+  :root { --ink:#1e293b; --muted:#64748b; --line:#cbd5e1; --bg:#f8fafc; --card:#fff; --green:#059669; --blue:#2563eb; --red:#dc2626; --amber:#d97706; }
+  * { box-sizing:border-box; }
+  body { font-family:-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; color:var(--ink); background:var(--bg); margin:0; line-height:1.6; }
+  .wrap { max-width:940px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:30px; margin:0 0 6px; }
+  h2 { font-size:21px; margin:40px 0 12px; padding-bottom:8px; border-bottom:2px solid var(--line); }
+  h3 { font-size:16px; margin:0 0 8px; }
+  .sub { color:var(--muted); font-size:16px; margin-top:0; }
+  code { background:#eef2ff; color:#3730a3; padding:1px 6px; border-radius:5px; font-size:.9em; }
+  p { margin:10px 0; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px 20px; margin:14px 0; box-shadow:0 1px 2px rgba(0,0,0,.04); }
+  table { border-collapse:collapse; width:100%; margin:10px 0; font-size:14px; }
+  th,td { border:1px solid var(--line); padding:8px 10px; text-align:left; vertical-align:top; }
+  th { background:#f1f5f9; }
+  .count { display:inline-block; background:var(--green); color:#fff; font-weight:700; border-radius:999px; padding:1px 9px; font-size:13px; }
+  pre { background:#0f172a; color:#e2e8f0; padding:14px 16px; border-radius:10px; overflow-x:auto; font-size:13px; line-height:1.5; }
+  pre .c { color:#94a3b8; } pre .g { color:#86efac; } pre .r { color:#fca5a5; } pre .y { color:#fcd34d; }
+  .note { border-left:4px solid var(--blue); background:#eff6ff; padding:10px 16px; border-radius:0 8px 8px 0; margin:14px 0; }
+  .bug { border-left:4px solid var(--red); background:#fef2f2; padding:10px 16px; border-radius:0 8px 8px 0; margin:14px 0; }
+  .win { border-left:4px solid var(--green); background:#ecfdf5; padding:10px 16px; border-radius:0 8px 8px 0; margin:14px 0; }
+  .small { font-size:13px; color:var(--muted); }
+  .tag { display:inline-block; font-size:11px; font-weight:700; letter-spacing:.4px; text-transform:uppercase; padding:2px 7px; border-radius:4px; }
+  .tag-bug { background:#fee2e2; color:var(--red); }
+  .fail { color:var(--red); font-weight:700; }
+  .pass { color:var(--green); font-weight:700; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Phase 0 — The Safety Net</h1>
+  <p class="sub">Making the turn orchestrator testable before LangGraph rewrites it. 44 → 71 tests, zero Groq tokens.</p>
+
+  <div class="card">
+    <p><b>Why now:</b> the LangGraph migration replaces the internals of
+    <code>handle_turn</code> — the single function every chat message flows through.
+    Before this phase, that function had <b>zero tests</b>. We could have rewritten it
+    completely, watched the suite go green, and shipped a broken tutor.</p>
+    <p class="small">Run with <code>python -m pytest</code>. Nothing here touches a live
+    Groq, MongoDB, Qdrant or Notion. The whole suite is 28 seconds.</p>
+  </div>
+
+  <h2>The problem we were in</h2>
+
+  <div class="card">
+    <table>
+      <tr><th>Module</th><th>What it does</th><th>Test coverage before Phase 0</th></tr>
+      <tr><td><code>tutor_service.py</code></td><td>Routes every message; owns the chatting↔teaching state machine</td><td class="fail">None. No test even imported it.</td></tr>
+      <tr><td><code>rerank_service.py</code></td><td>The relevance floor that fixed the Azure-PDF bug</td><td class="fail">None.</td></tr>
+      <tr><td>Groq client</td><td>Every LLM call in the app</td><td class="fail">No mock existed anywhere in the project.</td></tr>
+      <tr><td><code>keyword_service</code>, <code>hybrid_service</code>, <code>chunk_service</code></td><td>BM25, RRF, chunking</td><td class="pass">Well covered — pure functions, easy to test.</td></tr>
+    </table>
+    <p>The pattern is not an accident. The tested modules are <b>pure functions</b>. The untested
+    ones need a network. So the most important code in the app was the least tested — and all
+    three bugs it has shipped were found by a human reading chat transcripts in production.</p>
+  </div>
+
+  <h2>Why a fake LLM is the whole unlock</h2>
+
+  <div class="card">
+    <p>The orchestrator's decisions all have the same shape: <i>"what does the code do when the
+    model replies with exactly <code>X</code>?"</i></p>
+    <p>You cannot make a real LLM say exactly <code>START_TEACHING</code> on demand. And you
+    <i>certainly</i> can't make it say <code>START_TEACHING</code> <b>inside a sentence</b> on
+    demand — which is the case that matters, because that's the prompt-injection bug. Scripting
+    the reply is the only way to reach both branches.</p>
+
+<pre><span class="c"># tests/conftest.py</span>
+class FakeLLM:
+    <span class="c">"""Mimics the one slice of the Groq client the app uses:
+    await client.chat.completions.create(...).choices[0].message.content"""</span>
+
+    def __init__(self):
+        self.replies: list[str] = []
+        self.calls: list[SimpleNamespace] = []
+        self.chat = SimpleNamespace(completions=_FakeCompletions(self))
+
+    def script(self, *replies: str):
+        self.replies = list(replies)
+        return self</pre>
+
+    <p>The detail that earned its keep is what happens when the script runs out:</p>
+
+<pre><span class="c"># _FakeCompletions.create()</span>
+if not self._llm.replies:
+    raise AssertionError(
+        f"FakeLLM: the orchestrator made an unexpected extra LLM call "
+        f"(call #{len(self._llm.calls)}), but the script is exhausted."
+    )</pre>
+
+    <div class="note">
+      <p><b>Why not return <code>None</code>?</b> Because <b>an unexpected extra LLM call is itself
+      a regression.</b> When we later re-introduced the injection bug to test the tests, this
+      assertion fired first — the hijacked request had entered the teaching flow and called the
+      model a second time to deliver a lesson it should never have started. The fake caught the
+      hijack before any assertion in the test body ran.</p>
+    </div>
+  </div>
+
+  <h2>The patching gotcha</h2>
+
+  <div class="card">
+    <p><code>tutor_service</code> imports its dependencies by name at module load:</p>
+<pre><span class="c"># app/services/tutor_service.py</span>
+from app.core.session import get_context, set_context, add_message, get_session</pre>
+
+    <p>That <b>binds those function objects into <code>tutor_service</code>'s own namespace</b>.
+    Patching the source module does nothing — <code>tutor_service</code> already holds a reference
+    to the original.</p>
+
+<pre><span class="r">monkeypatch.setattr(app.core.session, "get_context", fake)   <span class="c"># no effect</span></span>
+<span class="g">monkeypatch.setattr(tutor, "get_context", store.get_context) <span class="c"># works</span></span></pre>
+
+    <p>The two Notion functions are the exception. <code>tutor_service</code> imports them
+    <i>lazily, inside the function bodies</i>, to break an import cycle — so the lookup happens at
+    call time, and those we patch at the source module.</p>
+
+<pre><span class="c"># inside _advance_topic()</span>
+from app.api.learn import save_single_note   <span class="c"># resolved when called...</span>
+
+<span class="c"># ...so patch it there</span>
+monkeypatch.setattr(learn, "save_single_note", notion.save_single_note)</pre>
+  </div>
+
+  <h2>FakeStore — asserting on state, not on prose</h2>
+
+  <div class="card">
+    <p>Its <code>contexts</code> dict mirrors the <code>session_contexts.data</code> sub-document,
+    which is where the guided-session state machine actually lives. That lets a test verify the
+    <b>state transition</b> directly instead of inferring it from the reply text.</p>
+
+<pre>class FakeStore:
+    def __init__(self, **initial_context):
+        self.contexts: dict = dict(initial_context)
+        self.messages: list[dict] = []
+
+    async def get_context(self, session_id, current_user_email):
+        <span class="c"># A copy, so a caller holding an old ctx can't observe later
+        # writes — matching Mongo, where get_context returns a snapshot.</span>
+        return dict(self.contexts)</pre>
+
+    <p>So an assertion reads like the thing you actually care about:</p>
+<pre>assert store.contexts["current_topic"] == 0          <span class="c"># did NOT advance</span>
+assert store.contexts["current_topic_doubts"] == ["What is a layer?"]</pre>
+  </div>
+
+  <h2>Three tests named after bugs that shipped</h2>
+
+  <div class="card">
+    <h3><span class="tag tag-bug">bug 1</span> &nbsp; Prompt injection via a control token</h3>
+    <div class="bug">
+      <p>An uploaded document containing the literal text <code>START_TEACHING</code> hijacked a
+      "summarize my document" request into the guided-teaching flow. <code>_handle_chatting</code>
+      was using a naive substring check.</p>
+    </div>
+<pre>async def test_document_naming_control_token_does_not_start_teaching(...):
+    <span class="c"># the model's reply CONTAINS the token, but is not the token</span>
+    fake_llm.script("The document says the assistant must emit START_TEACHING to begin.")
+
+    result = await tutor.handle_turn(SESSION, "Summarize my document.", USER)
+
+    assert result["status"] == "chatting"
+    assert "mode" not in store.contexts
+    assert fake_llm.call_count == 1          <span class="c"># no curriculum, no lesson</span>
+    assert "START_TEACHING" not in result["reply"]   <span class="c"># never reaches the screen</span></pre>
+    <p>The fix was strict whole-reply equality, not substring matching:</p>
+<pre>def _reply_is_token(reply: str, token: str) -> bool:
+    cleaned = re.sub(r"[^A-Za-z_]", "", (reply or "")).upper()
+    return cleaned == token</pre>
+    <p class="small">Stripping punctuation still tolerates <code>**NEXT_TOPIC**</code> and
+    <code>NEXT_TOPIC.</code> — the model likes to bold things — while rejecting the token in prose.</p>
+  </div>
+
+  <div class="card">
+    <h3><span class="tag tag-bug">bug 2</span> &nbsp; A question counted as "I understand, move on"</h3>
+    <div class="bug">
+      <p>A genuine learner question tripped <code>NEXT_TOPIC</code>. The system saved an empty,
+      non-personalized note and skipped a topic the learner had just said they didn't understand.</p>
+    </div>
+<pre>async def test_question_during_lesson_logs_doubt_and_does_not_advance(...):
+    fake_llm.script("A layer is a read-only filesystem diff...")
+
+    result = await tutor.handle_turn(SESSION, "What is a layer?", USER)
+
+    assert store.contexts["current_topic"] == 0                     <span class="c"># did NOT advance</span>
+    assert store.contexts["current_topic_doubts"] == ["What is a layer?"]
+    assert result["notion_pages"] == []                             <span class="c"># no note written</span></pre>
+  </div>
+
+  <div class="card">
+    <h3><span class="tag tag-bug">bug 3</span> &nbsp; "next topic" produced a header with no lesson</h3>
+    <div class="bug">
+      <p>On advancing, the delivery call saw <code>"next topic"</code> as the last user message and
+      replied <code>NEXT_TOPIC</code> again. That stripped to an empty string — the learner got a
+      topic heading and nothing underneath.</p>
+    </div>
+    <p>The fix was a directive appended to the delivery prompt. The test asserts on
+    <b>what the model was told</b>, not on what it replied:</p>
+<pre>async def test_delivery_prompt_instructs_model_to_teach_not_advance(...):
+    fake_llm.script("START_TEACHING", "Lesson text.")
+    await tutor.handle_turn(SESSION, "Teach me Docker", USER)
+
+    delivery_prompt = fake_llm.system_prompt(1)      <span class="c"># the 2nd LLM call</span>
+    assert "Deliver this topic now" in delivery_prompt
+    assert "do NOT output NEXT_TOPIC here" in delivery_prompt
+    assert "Images and Containers" in delivery_prompt</pre>
+    <p class="small">This is why <code>FakeLLM</code> records <code>calls</code>, not just replies.
+    A prompt is an input the code chose — and inputs are testable.</p>
+  </div>
+
+  <h2>The reranker: two subtleties worth pinning</h2>
+
+  <div class="card">
+    <h3><code>test_rerank_service.py</code> &nbsp;<span class="count">10</span></h3>
+    <div class="bug">
+      <p>An unrelated <code>AZURE_DEPLOYMENT_GUIDE.pdf</code> was cited as source <code>[5]</code>
+      on a question about Redis persistence. <code>rerank</code> always returned exactly
+      <code>top_k</code> chunks: it sorted by score, sliced to 5, and <b>threw the scores away</b>.
+      With only 2 relevant chunks it padded the list with the next-best three, however bad.</p>
+    </div>
+
+    <p>Real cross-encoder scores for <i>"how does redis persistence work"</i>:</p>
+    <table>
+      <tr><th>Document</th><th>Score range</th><th>Old behaviour</th><th>New behaviour</th></tr>
+      <tr><td><code>redis-notes.pdf</code></td><td>+7.879 … +0.300</td><td>returned</td><td class="pass">returned</td></tr>
+      <tr><td><code>kafka_basics.txt</code></td><td>−8.581</td><td class="fail">cited as a source</td><td>dropped</td></tr>
+      <tr><td><code>AZURE_DEPLOYMENT_GUIDE.pdf</code></td><td>−10.320</td><td class="fail">cited as a source</td><td>dropped</td></tr>
+    </table>
+
+    <p><b>Subtlety 1 — it's a logit, not a probability.</b> Strongly positive means the passage
+    answers the query; strongly negative means it doesn't. Zero is the boundary. Someone will
+    eventually "fix" the threshold to <code>0.5</code> thinking it's a probability and drop every
+    relevant chunk, so the constant itself gets a test:</p>
+<pre>def test_the_floor_is_zero_because_the_model_emits_a_logit():
+    assert RELEVANCE_THRESHOLD == 0.0</pre>
+
+    <p><b>Subtlety 2 — the best chunk survives even below the floor.</b> With zero chunks returned,
+    the grounding guard never gets attached to the prompt, and the model answers from world
+    knowledge instead of declining.</p>
+<pre>kept = [top[0]] + [pair for pair in top[1:] if float(pair[1]) &gt;= min_score]</pre>
+<pre>def test_when_nothing_is_relevant_exactly_one_chunk_survives(scores):
+    <span class="c"># "what is the capital of France" against a corpus of Redis notes</span>
+    points = _points("redis rdb", "redis aof", "redis replication")
+    scores([-2.0, -9.0, -5.0])
+
+    result = rerank("what is the capital of France", points, top_k=5)
+
+    assert len(result) == 1
+    assert _ids(result) == ["doc_0"]   <span class="c"># the least-bad one, not the first one</span></pre>
+
+    <div class="note">
+      <p>We monkeypatch <code>reranker.predict</code> rather than run the real model. That's
+      deliberate: <b>ms-marco model drift must not break these tests, but a change to the selection
+      rule must.</b> The tests assert on the selection logic, not on what the model happens to think today.</p>
+    </div>
+  </div>
+
+  <h2>Proving the tests actually work</h2>
+
+  <div class="card">
+    <p>A test that has never failed is decoration. So each bug was re-introduced into the
+    production code and the suite re-run.</p>
+    <table>
+      <tr><th>Mutation</th><th>Bug it recreates</th><th>Result</th></tr>
+      <tr><td><code>kept = top</code></td><td>rerank floor removed → the Azure bug</td><td class="fail">3 tests failed</td></tr>
+      <tr><td><code>return token in reply.upper()</code></td><td>substring check → prompt injection</td><td class="fail">2 tests failed</td></tr>
+      <tr><td><code>doubts.append(...)</code> deleted</td><td>notes generated without the learner's questions</td><td class="fail">1 test failed</td></tr>
+    </table>
+    <p>All three were reverted; <code>git diff app/</code> confirmed the production tree was untouched.</p>
+    <div class="win">
+      <p><b>The mutation run also caught something the assertions alone would have missed.</b>
+      The injection mutation failed on <code>FakeLLM</code>'s exhausted-script error, not on an
+      <code>assert</code> — because the hijacked request had already made a second LLM call to
+      deliver a lesson. A strict fake is a test in itself.</p>
+    </div>
+  </div>
+
+  <h2>What this buys the migration</h2>
+
+  <div class="card">
+    <table>
+      <tr><th>Property</th><th>Why it matters for LangGraph</th></tr>
+      <tr><td><b>Behaviour is pinned</b></td><td>Phase 3 replaces <code>handle_turn</code>'s branching with a <code>StateGraph</code>. These assertions must keep passing <i>unedited</i>. If a phase needs an assertion changed, that phase is changing product behaviour — and that must be a decision, not a quiet edit.</td></tr>
+      <tr><td><b>Zero tokens</b></td><td>The Groq free tier caps at 100k tokens/day, and one earlier stress test ate 96k. Phases 1–4 can now be developed without spending any.</td></tr>
+      <tr><td><b>Fast</b></td><td>28s for 71 tests. Fast enough to run on every save, which is the only way tests actually get run.</td></tr>
+      <tr><td><b>Scripted, not sampled</b></td><td>Phase 2 swaps control tokens for native tool calls. Only the <i>scripting</i> of the fake changes — a <code>tool_calls</code> payload instead of a magic string. The assertions stay identical, which is exactly how we'll know the swap was behaviour-preserving.</td></tr>
+    </table>
+  </div>
+
+  <h2>Files changed</h2>
+
+  <div class="card">
+    <table>
+      <tr><th>File</th><th>Change</th></tr>
+      <tr><td><code>tests/conftest.py</code></td><td><b>new</b> — <code>FakeLLM</code>, <code>FakeStore</code>, <code>NotionRecorder</code>, and the <code>make_tutor</code> fixture that wires them in</td></tr>
+      <tr><td><code>tests/test_tutor_service.py</code></td><td><b>new</b> — <span class="count">17</span> golden tests over the full state machine</td></tr>
+      <tr><td><code>tests/test_rerank_service.py</code></td><td><b>new</b> — <span class="count">10</span> tests over the relevance floor</td></tr>
+      <tr><td><code>pytest.ini</code></td><td><code>asyncio_mode = auto</code> — a bare <code>async def test_…</code> just runs, no decorator per test</td></tr>
+      <tr><td><code>requirements-dev.txt</code></td><td><code>pytest-asyncio==1.4.0</code>, verified against <code>pytest 9.1.1</code></td></tr>
+    </table>
+    <p class="small">Suite: 44 → <b>71 passing</b>. No production code was modified in this phase.</p>
+  </div>
+
+</div>
+</body>
+</html>

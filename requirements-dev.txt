@@ -3,4 +3,4 @@
 -r requirements.txt
 
 pytest==9.1.1
-# No pytest-asyncio: every test under tests/ is synchronous.
+pytest-asyncio==1.4.0          # handle_turn and the whole orchestrator are async
