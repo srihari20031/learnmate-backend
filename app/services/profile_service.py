@@ -12,13 +12,9 @@ import json
 import logging
 from datetime import datetime
 
-from groq import AsyncGroq
-from app.core.config import settings
 from app.core.session import get_context
 from app.database import profiles_collection
-
-client = AsyncGroq(api_key=settings.groq_api_key)
-MODEL = "llama-3.3-70b-versatile"
+from app.services.llm import ai_invoke
 
 # A resume/CV is small; cap the text we feed the extractor so token cost stays
 # bounded even for an oversized upload.
@@ -72,18 +68,13 @@ Return ONLY JSON, nothing else:
 Only include technologies the person clearly has real experience with (skills, projects, work history). Do not include tools merely mentioned in passing."""
 
     try:
-        response = await client.chat.completions.create(
-            model=MODEL,
+        response = await ai_invoke(
             messages=[{"role": "user", "content": prompt}],
+            temperature=0.0
         )
-        raw = (
-            response.choices[0]
-            .message.content.strip()
-            .replace("```json", "")
-            .replace("```", "")
-            .strip()
-        )
+        raw = response
         data = json.loads(raw)
+        
     except Exception:
         logger.exception("Stack extraction failed")
         return {"is_profile": False, "known_stack": None}

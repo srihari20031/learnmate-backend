@@ -2,15 +2,13 @@ import asyncio
 import re
 import secrets
 from types import SimpleNamespace
-from groq import AsyncGroq
 from app.core.config import settings
 from app.core.session import get_session, add_message, set_context, get_context
 from app.prompts.intake import SYSTEM_PROMPT
 from app.services.profile_service import resolve_known_stack, merge_stacks
+from app.services.llm import ai_invoke
 import json
 
-client = AsyncGroq(api_key=settings.groq_api_key)
-MODEL = "llama-3.3-70b-versatile"
 MAX_CONTEXT_CHARS = 100_000
 
 # Internal control token the intake prompt emits when it's ready to build notes.
@@ -53,13 +51,14 @@ Return ONLY JSON like this, nothing else:
 {{"target_tech": "FastAPI", "known_stack": "Node.js"}}
 If not found return null for that field.
 """
-    response = await client.chat.completions.create(
-        model=MODEL,
-        messages=[{"role": "user", "content": prompt}]
+    response = await ai_invoke(
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.0
     )
-    
+
     try:
-        text = response.choices[0].message.content.strip().replace("```json", "").replace("```", "").strip()
+        # ai_invoke returns the message text directly (already stripped).
+        text = response.replace("```json", "").replace("```", "").strip()
         data = json.loads(text)
         print("Extracted context:", data)
         if data.get("target_tech"):
@@ -285,8 +284,7 @@ async def get_claude_response(
     known_stack = await resolve_known_stack(session_id, current_user_email)
     messages = build_llm_messages(history, document_context, known_stack)
 
-    response = await client.chat.completions.create(model=MODEL, messages=messages)
-    reply = response.choices[0].message.content
+    reply = await ai_invoke(messages, temperature=0.0)
 
     mark_cited_sources(reply, sources)
 
@@ -370,11 +368,11 @@ List 6-8 key topics, ordered as a proper LEARNING PATH: start with the core fund
 Return ONLY a JSON array of topic strings in learning order, nothing else.
 Example (for Docker): ["Images and Containers", "Writing a Dockerfile", "Volumes and Data Persistence", "Networking", "Docker Compose"]
 """
-    response = await client.chat.completions.create(
-        model=MODEL,
-        messages=[{"role": "user", "content": prompt}]
+    response = await ai_invoke(
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.0
     )
 
-    text = response.choices[0].message.content.strip().replace("```json", "").replace("```", "").strip()
+    text = response.replace("```json", "").replace("```", "").strip()
     topics = json.loads(text)
     return topics

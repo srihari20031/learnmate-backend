@@ -19,8 +19,6 @@ import re
 
 from app.core.session import get_context, set_context, add_message, get_session
 from app.services.claude_service import (
-    client,
-    MODEL,
     apply_sliding_window,
     to_llm_messages,
     build_llm_messages,
@@ -32,6 +30,7 @@ from app.services.claude_service import (
     generate_curriculum_ai,
 )
 from app.prompts.intake import TEACHING_PROMPT
+from app.services.llm import ai_invoke
 
 START_TEACHING = "START_TEACHING"
 NEXT_TOPIC = "NEXT_TOPIC"
@@ -76,8 +75,8 @@ async def _complete(system_prompt: str, history: list) -> str:
     messages = [{"role": "system", "content": system_prompt}] + apply_sliding_window(
         to_llm_messages(history)
     )
-    response = await client.chat.completions.create(model=MODEL, messages=messages)
-    return response.choices[0].message.content
+    response = await ai_invoke(messages=messages, temperature=0.0)
+    return response
 
 
 def _build_teaching_prompt(ctx: dict) -> str:
@@ -150,8 +149,8 @@ async def _handle_chatting(session_id, user_email, user_message, ctx) -> dict:
     messages = build_llm_messages(history, document_context, known_stack)
 
     reply = (
-        await client.chat.completions.create(model=MODEL, messages=messages)
-    ).choices[0].message.content
+        await ai_invoke(messages=messages, temperature=0.0)
+    )
 
     # Strict token interception: the whole reply must BE the token. A substring
     # check is exploitable — an uploaded document that merely names a token, or
